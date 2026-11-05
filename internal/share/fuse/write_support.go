@@ -193,11 +193,12 @@ func (h *stagingUploadHandle) Write(_ context.Context, data []byte, off int64) (
 }
 
 func (h *stagingUploadHandle) Flush(_ context.Context) syscall.Errno {
+	// Flush 只做落盘，不在这里建上传任务：
+	// 内核可能在上层仍持有写入请求时就下发 FLUSH，此时临时文件还没写全，
+	// 按那时的 stat 建任务会让服务端按偏小的总长度校验分块并直接拒收
+	// （实测 512KB 只报到 2075/11264 字节）。真正入队放到 Release。
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.queued {
-		return 0
-	}
 	if h.file == nil {
 		return syscall.EBADF
 	}
@@ -207,17 +208,33 @@ func (h *stagingUploadHandle) Flush(_ context.Context) syscall.Errno {
 	if err := h.file.Sync(); err != nil {
 		return errnoFor(err)
 	}
+	if h.node != nil {
+		if st, err := h.file.Stat(); err == nil {
+			h.node.updateFromStat(st)
+		}
+	}
+	return 0
+}
+
+// queueUpload 在句柄真正释放时把临时文件交给上传队列。
+func (h *stagingUploadHandle) queueUpload() syscall.Errno {
+	if h.queued {
+		return 0
+	}
+	if h.file == nil {
+		return 0
+	}
+	if err := h.file.Sync(); err != nil {
+		return errnoFor(err)
+	}
 	st, err := h.file.Stat()
 	if err != nil {
 		return errnoFor(err)
 	}
-	// 内核可能还有异步回写未落地：以节点记录的最大写入长度为基准短暂等待，
-	// 避免用偏小的文件长度去建上传任务（服务端会按总长度校验分块）。
 	st = h.waitStagedSize(st)
 	if h.node != nil {
 		h.node.updateFromStat(st)
 	}
-	// 若在 close 前已发生 rename，以节点当前名为准，避免上传任务使用旧名。
 	fileName := h.fileName
 	parentID := h.parentID
 	displayPath := h.targetDisplayPath
@@ -242,7 +259,7 @@ func (h *stagingUploadHandle) Flush(_ context.Context) syscall.Errno {
 		tracked := h.node.size
 		h.node.mu.RUnlock()
 		h.node.b.deps.Log.Warn("FUSE staging flush",
-			"name", fileName, "tracked_size", tracked, "file_size", st.Size(), "temp", h.tempPath)
+			"name", fileName, "tracked_size", tracked, "file_size", st.Size(), "temp", h.tempPath, "phase", "release")
 	}
 	task, terr := h.uploads.Create(context.Background(), upload.CreateParams{
 		AccountID:         h.accountID,
@@ -256,9 +273,6 @@ func (h *stagingUploadHandle) Flush(_ context.Context) syscall.Errno {
 	})
 	if terr != nil {
 		return errnoFor(terr)
-	}
-	if h.node != nil && h.node.b != nil && h.node.b.deps.Log != nil {
-		h.node.b.deps.Log.Debug("FUSE staging task created", "name", fileName, "task", taskID(task))
 	}
 	if h.node != nil && task != nil {
 		h.node.mu.Lock()
@@ -293,6 +307,10 @@ func (h *stagingUploadHandle) Release(_ context.Context) syscall.Errno {
 		return 0
 	}
 	h.released = true
+	// 最后一次关闭：此时所有写入都已落地，可以安全地按真实大小建上传任务。
+	if errno := h.queueUpload(); errno != 0 && h.node != nil && h.node.b != nil && h.node.b.deps.Log != nil {
+		h.node.b.deps.Log.Warn("FUSE staging 入队失败", "name", h.fileName, "errno", errno)
+	}
 	if h.file != nil {
 		_ = h.file.Close()
 		h.file = nil
