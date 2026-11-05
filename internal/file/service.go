@@ -433,11 +433,24 @@ func (s *Service) MoveAndRename(ctx context.Context, accountID int64, fileID, ol
 	// 跨目录但文件名不变（或调用方拿不到原名）：只做移动，最后再按新名字校验。
 	if oldName == "" || oldName == newName {
 		if err := s.MoveFiles(ctx, accountID, []string{fileID}, targetParentID, sourceParentID); err != nil {
-			// 幂等兜底：调用方重试时，上一次移动其实已经完成，源已不在、目标里已有同名文件。
-			// 这种“移动报错但结果已就位”必须按成功返回，否则上层（FUSE/mdc）会一直重试到失败。
+			// 网关层的最终一致性：新建的目标目录在对方索引里可能还没生效，
+			// 移动接口会报 not found，但文件实际上已经被移过去了。
+			// 碰到这种情况必须先把结果核实清楚，否则会把已完成的操作报成
+			// ENOENT，调用方（FUSE 的 mv、mdc 的整理）随后重试时源已不在，彻底失败。
 			if id, ok := s.resolveMoved(ctx, accountID, targetParentID, newName); ok {
 				s.log.Info("移动报错但目标已就位，按成功处理",
 					"account_id", accountID, "parent_id", targetParentID, "name", newName, "err", err)
+				return id, nil
+			}
+			// 核实不到就重试一次：目标目录刚建好时首次调用可能必然落空。
+			time.Sleep(800 * time.Millisecond)
+			if retryErr := s.MoveFiles(ctx, accountID, []string{fileID}, targetParentID, sourceParentID); retryErr == nil {
+				if id, retryFindErr := s.findChildIDRetry(ctx, accountID, targetParentID, newName); retryFindErr == nil {
+					return id, nil
+				}
+			} else if id, ok := s.resolveMoved(ctx, accountID, targetParentID, newName); ok {
+				s.log.Info("重试移动报错但目标已就位，按成功处理",
+					"account_id", accountID, "parent_id", targetParentID, "name", newName, "err", retryErr)
 				return id, nil
 			}
 			return "", err
@@ -517,7 +530,7 @@ func (s *Service) MoveAndRename(ctx context.Context, accountID int64, fileID, ol
 // mdc 的整理流程）随后重试时源已不在，于是又变成 ENOENT，最终表现为“一堆失败但文件其实动了”。
 // 这里按短退避多查几次，给列表一点追平的时间。
 func (s *Service) findChildIDRetry(ctx context.Context, accountID int64, parentID, name string) (string, error) {
-	delays := []time.Duration{0, 200 * time.Millisecond, 600 * time.Millisecond, 1500 * time.Millisecond}
+	delays := []time.Duration{0, 300 * time.Millisecond, 700 * time.Millisecond, 1500 * time.Millisecond, 3000 * time.Millisecond, 3000 * time.Millisecond}
 	var lastErr error
 	for _, delay := range delays {
 		if delay > 0 {
@@ -542,7 +555,7 @@ func (s *Service) resolveMoved(ctx context.Context, accountID int64, targetParen
 	if strings.TrimSpace(name) == "" {
 		return "", false
 	}
-	id, err := s.findChildID(ctx, accountID, targetParentID, name)
+	id, err := s.findChildIDRetry(ctx, accountID, targetParentID, name)
 	if err != nil {
 		return "", false
 	}
