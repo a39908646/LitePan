@@ -182,10 +182,6 @@ func (h *stagingUploadHandle) Write(_ context.Context, data []byte, off int64) (
 	if n > 0 && h.node != nil {
 		h.node.updateSize(off + int64(n))
 	}
-	if h.node != nil && h.node.b != nil && h.node.b.deps.Log != nil {
-		h.node.b.deps.Log.Debug("FUSE staging write",
-			"name", h.node.name, "off", off, "len", len(data), "n", n, "err", err)
-	}
 	if err != nil {
 		return uint32(n), errnoFor(err)
 	}
@@ -258,8 +254,8 @@ func (h *stagingUploadHandle) queueUpload() syscall.Errno {
 		h.node.mu.RLock()
 		tracked := h.node.size
 		h.node.mu.RUnlock()
-		h.node.b.deps.Log.Warn("FUSE staging flush",
-			"name", fileName, "tracked_size", tracked, "file_size", st.Size(), "temp", h.tempPath, "phase", "release")
+		h.node.b.deps.Log.Debug("FUSE staging upload queued",
+			"name", fileName, "tracked_size", tracked, "file_size", st.Size(), "temp", h.tempPath)
 	}
 	task, terr := h.uploads.Create(context.Background(), upload.CreateParams{
 		AccountID:         h.accountID,
