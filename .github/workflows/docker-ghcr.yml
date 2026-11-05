@@ -1,0 +1,129 @@
+name: docker-ghcr
+
+# 构建二开镜像并推到 GHCR，供 fnOS / NAS 直接 pull。
+#
+# 触发：
+#   · 推 tag（如 v0.5.7-beta-fork.1）→ 推 latest + 该 tag 名 + sha-xxxxxxx
+#   · 手动 workflow_dispatch        → 推 edge + sha-xxxxxxx
+#
+# 构建前会把版本号写进源码（只在 runner 的工作区里改，不提交）：
+#   · web/src/version.ts            → 前端 UI 显示的版本
+#   · internal/buildinfo/version.go → 后端 /api 返回的版本
+#   这样镜像里显示的版本 = 镜像 tag，不会出现"跑的是哪个镜像"分不清的情况。
+#   不这么做的替代方案是改 Dockerfile 加 ldflags / build-arg，但那要动上游文件，
+#   会让上游同步变贵（见 docs/upstream-sync.md §4）；这里选 sed 源码 + 断言校验。
+#
+# 首次使用前：仓库 Actions 页面点一次 enable（fork 默认不放行工作流）。
+# 推上去后包默认 private：GitHub → Packages → 该包 → Settings → Change visibility → Public，
+# 或在 NAS 上 docker login ghcr.io（PAT 勾 read:packages），详见 docs/upstream-sync.md §9。
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+concurrency:
+  group: docker-ghcr-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # GHCR 要求镜像名全小写：a39908646/LitePan → a39908646/litepan
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # git describe 需要 tag 历史
+
+      # ── 版本号：镜像 tag = UI 显示版本 ─────────────────────────────────────
+      - name: 计算版本号并注入源码
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA="$(git rev-parse --short HEAD)"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            VER="${GITHUB_REF_NAME}"
+          else
+            BASE="$(git describe --tags --abbrev=0 2>/dev/null || echo v0.0.0)"
+            VER="${BASE}-fork.${SHA}"
+          fi
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+          echo "版本号：${VER}"
+
+          # 前端：UI 显示的版本
+          sed -i -E "s|^export const APP_VERSION = \".*\";|export const APP_VERSION = \"${VER}\";|" web/src/version.ts
+          grep -qF "APP_VERSION = \"${VER}\";" web/src/version.ts \
+            || { echo "::error::web/src/version.ts 版本注入失败（上游可能改了这个文件的结构）"; exit 1; }
+
+          # 后端：/api 返回的版本（注意 Go 行尾无分号，且不要用 $ 锚点，避免被 CRLF 的 \r 卡住）
+          sed -i -E "s|^var Version = \".*\"|var Version = \"${VER}\"|" internal/buildinfo/version.go
+          grep -qF "Version = \"${VER}\";" internal/buildinfo/version.go \
+            || { echo "::error::internal/buildinfo/version.go 版本注入失败（上游可能改了这个文件的结构）"; exit 1; }
+
+          # 断言没被改坏：镜像名必须全小写
+          echo "IMAGE=${IMAGE_NAME,,}" >> "$GITHUB_OUTPUT"
+
+      # ── 构建与推送 ─────────────────────────────────────────────────────────
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 生成镜像 tag
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.ver.outputs.IMAGE }}
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
+            type=ref,event=tag
+            type=raw,value=edge,enable=${{ github.ref_type != 'tag' }}
+            type=sha,format=short,prefix=sha-
+          labels: |
+            org.opencontainers.image.title=LitePan (fork)
+            org.opencontainers.image.version=${{ steps.ver.outputs.version }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          build-args: |
+            BUILD_TAGS=fuse
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # 关掉 provenance/SBOM：保持单平台普通镜像，老版本 docker / docker save 更好兼容
+          provenance: false
+          sbom: false
+
+      - name: 输出镜像地址
+        run: |
+          {
+            echo "### 镜像已推送"
+            echo ""
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            echo ""
+            echo "版本号：\`${{ steps.ver.outputs.version }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

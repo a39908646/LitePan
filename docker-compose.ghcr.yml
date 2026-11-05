@@ -1,0 +1,20 @@
+# GHCR 镜像覆盖层
+#
+# 只覆盖 image 一项，其余（volumes / devices / privileged / pid / network_mode）
+# 全部沿用基础 compose 文件 —— 因此上游的 docker-compose.yml 与
+# docker-compose.fnos.yml 一行都不用改（见 docs/upstream-sync.md §4 落点纪律）。
+#
+# 用法（fnOS / NAS，用你自己的路径那套）：
+#   docker compose -f docker-compose.fnos.yml -f docker-compose.ghcr.yml pull
+#   docker compose -f docker-compose.fnos.yml -f docker-compose.ghcr.yml up -d
+#
+# 用法（标准端口映射）：
+#   docker compose -f docker-compose.yml -f docker-compose.ghcr.yml up -d
+#
+# 回滚：把 tag 换成上一次的 vX.Y.Z-fork.<n> 或 sha-xxxxxxx（Actions 里能看到全部 tag）
+#
+# 包默认 private，NAS 首次 pull 若报 401：见 docs/upstream-sync.md §9
+services:
+  litepan:
+    image: ghcr.io/a39908646/litepan:latest
+    pull_policy: always

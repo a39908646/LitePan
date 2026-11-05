@@ -197,3 +197,40 @@ make build-nofuse
 | 把上游当 Go module 依赖 | 单体应用 + `//go:embed`，拆不动 |
 | patch 队列（quilt / stgit） | 改动量不足以抵消工具成本 |
 | 改 module path | 见 §4 硬约束 1 |
+
+---
+
+## 9. Docker 镜像（GHCR）
+
+上游镜像在 Docker Hub（`ponphil/litepan:beta`），是**纯上游代码**，不含任何二开。
+二开镜像由 `.github/workflows/docker-ghcr.yml` 构建并推到 GHCR：
+
+| 项 | 值 |
+|---|---|
+| 镜像 | `ghcr.io/a39908646/litepan` |
+| 触发 | 推 tag（`v*`）→ `latest` + tag 名 + `sha-xxxxxxx`；手动 `workflow_dispatch` → `edge` + `sha-xxxxxxx` |
+| 架构 | `linux/amd64`（要 arm64 改 workflow 里 `platforms` 一行，并给 web 阶段加 `--platform=$BUILDPLATFORM`） |
+| 版本注入 | 构建前把版本号 sed 进 `web/src/version.ts`（UI 显示）和 `internal/buildinfo/version.go`（`/api` 返回），只在 runner 工作区改，不提交；sed 后断言校验，上游改了文件结构会直接失败 |
+
+**为什么不改 Dockerfile 加 ldflags**：`Dockerfile` 是上游文件，改了每次同步都要处理冲突（§4 落点纪律）。
+sed + 断言在 CI 里完成同样的事，仓库里的上游文件保持原样。
+
+### NAS 上使用
+
+`docker-compose.ghcr.yml` 是一个 **只覆盖 `image` 的覆盖层**，基础配置（`volumes` / `devices` /
+`privileged` / `pid: host` / `network_mode`）仍用上游那两个 compose 文件，一行都不用改：
+
+```bash
+docker compose -f docker-compose.fnos.yml -f docker-compose.ghcr.yml pull
+docker compose -f docker-compose.fnos.yml -f docker-compose.ghcr.yml up -d
+```
+
+回滚：把 `image:` 换成上一次的 `vX.Y.Z-fork.<n>` 或 `sha-xxxxxxx`（Actions 页面能看到全部 tag）。
+
+### 三个必踩的坑
+
+1. **GHCR 包默认 private**，即使仓库是 public。NAS `docker pull` 报 `401 Unauthorized` 时的解法：
+   - 公共镜像：GitHub → 你的头像 → Packages → `litepan` → Settings → Danger Zone → Change visibility → Public
+   - 保持私有：NAS 上 `docker login ghcr.io -u a39908646 -p <PAT>`（PAT 勾 `read:packages`）
+2. **fork 的 Actions 要手动 enable 一次**（仓库 Actions 页面），否则推 tag 后什么都不发生。
+3. **别只依赖 `latest`**：NAS 上 `pull` 完不记版本号，出问题只能靠 `sha-xxxxxxx` 回滚。
