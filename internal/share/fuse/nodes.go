@@ -307,7 +307,8 @@ func (d *cloudDir) renameStaging(ctx context.Context, st *stagingFile, targetDir
 			newTarget = targetDir.item.ID
 			newDisplay = targetDir.targetDisplayPath()
 		}
-		if _, err := st.uploads.RenameTask(ctx, taskID, newName, newTarget, newDisplay); err != nil && d.b.deps.Log != nil {
+		applied, err := st.uploads.RenameTask(ctx, taskID, newName, newTarget, newDisplay)
+		if err != nil && d.b.deps.Log != nil {
 			d.b.deps.Log.Warn("FUSE staging rename 更新上传任务失败",
 				"task_id", taskID,
 				"old_name", oldName,
@@ -315,6 +316,36 @@ func (d *cloudDir) renameStaging(ctx context.Context, st *stagingFile, targetDir
 				"err", err,
 			)
 		}
+		if applied {
+			return 0
+		}
+		// 任务已经结束（上传完成），改名没能落到上传任务上：文件现在已经在云端，
+		// 必须对云端改名，否则本地名字变了、云端还是旧名，而调用方却以为成功。
+		return d.renameFinishedStaging(ctx, targetDir, oldName, newName)
+	}
+	if st.uploads == nil {
+		return d.renameFinishedStaging(ctx, targetDir, oldName, newName)
+	}
+	return 0
+}
+
+// renameFinishedStaging 处理"上传已完成、但改名只改了本地节点"的情况：补一次云端改名/移动。
+func (d *cloudDir) renameFinishedStaging(ctx context.Context, targetDir *cloudDir, oldName, newName string) syscall.Errno {
+	src, found, errno := d.lookupChildItemIfExists(ctx, oldName)
+	if errno != 0 {
+		return errno
+	}
+	if !found {
+		// 云端还看不到（极短窗口内的最终一致性），交给上传任务后续处理，不当成失败。
+		return 0
+	}
+	if targetDir.item.ID != d.item.ID {
+		if err := d.b.deps.Files.MoveFiles(ctx, d.b.accountID(), []string{src.ID}, targetDir.item.ID, d.item.ID); err != nil {
+			return errnoFor(err)
+		}
+	}
+	if err := d.b.deps.Files.RenameFile(ctx, d.b.accountID(), src.ID, newName, targetDir.item.ID); err != nil {
+		return errnoFor(err)
 	}
 	return 0
 }

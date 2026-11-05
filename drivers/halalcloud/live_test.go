@@ -19,7 +19,9 @@ import (
 //	  go test -tags live ./drivers/halalcloud/ -run TestLiveSmoke -v -timeout 10m
 //
 // 步骤：建客户端 → 拉用户信息(Ping) → 列根目录 → 建测试目录 → 上传 1KB
-//      → 回读确认 → 取直链 → 回收站删除 → 清理测试目录。
+//
+//	→ 回读确认 → 取直链 → 回收站删除 → 清理测试目录。
+//
 // 任何一步失败都会打印该步的原始错误，方便定位是协议问题还是权限问题。
 func TestLiveSmoke(t *testing.T) {
 	clientID := os.Getenv("HALAL_CLIENT_ID")

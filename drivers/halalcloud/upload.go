@@ -69,13 +69,11 @@ func (d *Driver) UploadLocalFile(ctx context.Context, req driver.LocalUploadRequ
 	if task.Created {
 		// Created=true 只说明服务端已有同名条目，不保证内容是对的：
 		// 上一次 makeFile 失败会留下 0 字节占位，重试时服务端就回 Created=true。
-		// 所以必须回读确认大小，不一致就继续走正常分块上传把它覆盖掉。
-		if existing, err := d.files.Get(ctx, &sdkUserFile.File{Path: targetPath}); err == nil && existing != nil && existing.Size == size {
+		// 这里用「父目录列表」核对实际大小（Get 返回的是任务占位元数据，不可靠），
+		// 不一致就走正常分块上传把它覆盖掉。
+		if got, ok := d.cloudSize(ctx, parent, name); ok && got == size {
 			uploadutil.NotifyProgress(req.OnProgress, size, size, "秒传成功")
 			result.Message = "秒传成功（服务端已存在相同内容）"
-			if strings.TrimSpace(existing.Path) != "" {
-				result.FileID = existing.Path
-			}
 			return result, nil
 		}
 	}
@@ -132,6 +130,10 @@ func (d *Driver) UploadLocalFile(ctx context.Context, req driver.LocalUploadRequ
 	}
 	if created != nil && strings.TrimSpace(created.Path) != "" {
 		result.FileID = created.Path
+	}
+	// 收尾后核对实际大小，避免"报成功但云端是 0 字节/截断"。
+	if got, ok := d.cloudSize(ctx, parent, name); ok && got != size {
+		return nil, domain.Errorf(domain.CodeDriverError, "上传后大小不一致：云端 %d 字节，本地 %d 字节", got, size)
 	}
 	uploadutil.NotifyProgress(req.OnProgress, size, size, "上传成功")
 	result.Message = "上传成功"
@@ -213,10 +215,10 @@ func (d *Driver) probeSlice(ctx context.Context, client *http.Client, endpoint s
 // 不能直接反序列化到 sdkUserFile.File：SDK 把 size 声明成 json:",string"，
 // 而该接口实际返回的是原始数字，会报 "cannot unmarshal number into ... size of type int64"。
 type makeFileResult struct {
-	Identity        string   `json:"identity"`
-	Path            string   `json:"path"`
-	Size            flexInt  `json:"size"`
-	ContentIdentity string   `json:"content_identity"`
+	Identity        string  `json:"identity"`
+	Path            string  `json:"path"`
+	Size            flexInt `json:"size"`
+	ContentIdentity string  `json:"content_identity"`
 }
 
 // flexInt 兼容 JSON 里数字与字符串两种编码。
@@ -288,4 +290,18 @@ func truncateForError(raw []byte) string {
 		return text[:200] + "..."
 	}
 	return text
+}
+
+// cloudSize 通过父目录列表查同名文件的真实大小（列表是权威视图，任务占位不算）。
+func (d *Driver) cloudSize(ctx context.Context, parent, name string) (int64, bool) {
+	items, err := d.ListFiles(ctx, parent)
+	if err != nil {
+		return 0, false
+	}
+	for _, it := range items {
+		if it.Name == name && !it.IsDir {
+			return it.Size, true
+		}
+	}
+	return 0, false
 }
