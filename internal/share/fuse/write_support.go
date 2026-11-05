@@ -169,13 +169,16 @@ type stagingUploadHandle struct {
 }
 
 func (h *stagingUploadHandle) Write(_ context.Context, data []byte, off int64) (uint32, syscall.Errno) {
+	// 必须持锁写完：Flush 会持同一把锁做 Sync+Stat 并把 st.Size() 当作上传总长度。
+	// 之前这里先解锁再写盘，Flush 可能在大块写入尚未落盘时就算出偏小的总长度
+	// （实测 1MB 文件只报到 24576 字节），导致服务端拒绝分块：
+	// "invalid block size: 1048576 != 24576 % 4194304"。
 	h.mu.Lock()
-	file := h.file
-	h.mu.Unlock()
-	if file == nil {
+	defer h.mu.Unlock()
+	if h.file == nil {
 		return 0, syscall.EBADF
 	}
-	n, err := file.WriteAt(data, off)
+	n, err := h.file.WriteAt(data, off)
 	if n > 0 && h.node != nil {
 		h.node.updateSize(off + int64(n))
 	}
@@ -204,6 +207,9 @@ func (h *stagingUploadHandle) Flush(_ context.Context) syscall.Errno {
 	if err != nil {
 		return errnoFor(err)
 	}
+	// 内核可能还有异步回写未落地：以节点记录的最大写入长度为基准短暂等待，
+	// 避免用偏小的文件长度去建上传任务（服务端会按总长度校验分块）。
+	st = h.waitStagedSize(st)
 	if h.node != nil {
 		h.node.updateFromStat(st)
 	}
@@ -336,4 +342,34 @@ func createFuseTempFile(uploads UploadManager, fileName string) (*os.File, strin
 		_ = os.Remove(path)
 	}
 	return f, path, cleanup, untrack, nil
+}
+
+// waitStagedSize 在 Sync 之后抹平「节点已记录写入长度、但临时文件还短一截」的窗口。
+// 最多等 2 秒；超时仍不一致就按实际大小返回，由上层如实报错，不静默丢数据。
+func (h *stagingUploadHandle) waitStagedSize(st os.FileInfo) os.FileInfo {
+	if h.node == nil || st == nil {
+		return st
+	}
+	h.node.mu.RLock()
+	expected := h.node.size
+	h.node.mu.RUnlock()
+	if expected <= st.Size() {
+		return st
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+		if err := h.file.Sync(); err != nil {
+			return st
+		}
+		current, err := h.file.Stat()
+		if err != nil {
+			return st
+		}
+		st = current
+		if st.Size() >= expected {
+			return st
+		}
+	}
+	return st
 }
