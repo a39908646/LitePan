@@ -69,8 +69,8 @@ func (d *Driver) Init(ctx context.Context) error {
 	}
 	host := normalizeHost(d.add.Host)
 	timeout := defaultTimeout
-	if d.add.Timeout > 0 {
-		timeout = time.Duration(d.add.Timeout) * time.Second
+	if secs := d.add.Timeout.Int(); secs > 0 {
+		timeout = time.Duration(secs) * time.Second
 	}
 	d.http = &http.Client{Timeout: timeout}
 	store := &configStore{values: map[string]string{}}

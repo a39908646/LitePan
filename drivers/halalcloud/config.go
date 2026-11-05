@@ -26,7 +26,10 @@ type Addition struct {
 	ClientSecret string `json:"client_secret" label:"Client Secret" type:"password" form:"required,pair=auth"`
 	RootPath     string `json:"root_path" label:"子目录路径" form:"pair=base" example:"/"`
 	Host         string `json:"host" label:"API 地址" default:"openapi.2dland.cn" form:"pair=base"`
-	Timeout      int    `json:"timeout_seconds" label:"请求超时（秒）" type:"number" default:"60" form:"pair=opts1"`
+	Timeout      flexInt `json:"timeout_seconds" label:"请求超时（秒）" type:"number" default:"60" form:"pair=opts1"`
 	// RefreshToken 由 SDK 在令牌续期时回写，用户不需要填。
 	RefreshToken string `json:"refresh_token" label:"Refresh Token" form:"hidden"`
 }
+
+// Int 取整数值（替代直接类型比较，便于表单传字符串时也能用）。
+func (f flexInt) Int() int { return int(f) }
