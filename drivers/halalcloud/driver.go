@@ -39,7 +39,7 @@ var config = driver.Config{
 	SortOrder:   98,
 	AuthLabel:   "Client ID / Secret",
 	CardColor:   "#5b8def",
-	CardLogo:    "/logos/webdav.png",
+	CardLogo:    "/logos/2dland.svg",
 	DefaultRoot: "/",
 	AuthType:    driver.AuthNone,
 }
