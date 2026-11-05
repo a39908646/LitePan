@@ -90,6 +90,10 @@ type watchDir struct {
 	taskID   int64
 	root     string
 	identity os.FileInfo
+	// hasStrm 表示该目录下曾经出现过 *.strm。只有真 STRM 输出目录被删掉时，
+	// 才联动删云端源文件；否则其它程序（刮削工具等）在 STRM 目录里建/删临时目录
+	// 会被当成“用户删了 STRM”而误删网盘上的真实媒体。
+	hasStrm bool
 }
 
 type candidate struct {
@@ -500,10 +504,17 @@ func (s *Service) addTree(ctx context.Context, taskID int64, root, start string)
 		}
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		_, exists := s.watched[path]
-		if !exists && s.watcher != nil {
+		if existing, exists := s.watched[path]; exists {
+			// 目录已监听：补上 hasStrm 资格（启动时可能还没生成 .strm）。
+			if !existing.hasStrm && dirHasStrm(path) {
+				existing.hasStrm = true
+				s.watched[path] = existing
+			}
+			return nil
+		}
+		if s.watcher != nil {
 			if addErr := s.watcher.Add(path); addErr == nil {
-				s.watched[path] = watchDir{taskID: taskID, root: root, identity: identity}
+				s.watched[path] = watchDir{taskID: taskID, root: root, identity: identity, hasStrm: dirHasStrm(path)}
 				if path == root {
 					s.roots[taskID] = root
 				}
@@ -515,6 +526,32 @@ func (s *Service) addTree(ctx context.Context, taskID int64, root, start string)
 		}
 		return nil
 	})
+}
+
+// dirHasStrm 判断目录里是否存在 *.strm 文件。
+func dirHasStrm(path string) bool {
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.EqualFold(filepath.Ext(entry.Name()), ".strm") {
+			return true
+		}
+	}
+	return false
+}
+
+// markHasStrm 标记目录具备联动删除资格（该目录里刚出现了一个 .strm）。
+func (s *Service) markHasStrm(path string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	info, ok := s.watched[path]
+	if !ok || info.hasStrm {
+		return
+	}
+	info.hasStrm = true
+	s.watched[path] = info
 }
 
 func (s *Service) handleEvent(ctx context.Context, evt fsnotify.Event) error {
@@ -531,6 +568,10 @@ func (s *Service) handleEvent(ctx context.Context, evt fsnotify.Event) error {
 	if evt.Op&fsnotify.Create != 0 {
 		if st, err := os.Stat(evt.Name); err == nil && st.IsDir() {
 			return s.addTree(ctx, info.taskID, info.root, evt.Name)
+		}
+		// 新出现的 .strm 让所在目录具备联动删除资格。
+		if strings.EqualFold(filepath.Ext(evt.Name), ".strm") {
+			s.markHasStrm(filepath.Dir(evt.Name))
 		}
 		return nil
 	}
@@ -554,6 +595,12 @@ func (s *Service) handleEvent(ctx context.Context, evt fsnotify.Event) error {
 	}
 	if knownDir {
 		s.removeTree(evt.Name)
+		// 目录里从未出现过 .strm：这是别的程序（如刮削工具）的临时元数据目录，
+		// 不能当成“用户删了 STRM”去删云端源文件。
+		if !info.hasStrm {
+			s.log.Debug("STRM 删除监听跳过非 STRM 目录", "task_id", info.taskID, "path", evt.Name)
+			return nil
+		}
 	}
 	s.queue(ctx, candidate{taskID: info.taskID, path: evt.Name, isDir: isDir})
 	return nil

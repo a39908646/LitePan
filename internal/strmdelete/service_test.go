@@ -393,16 +393,16 @@ func TestBatchConfirmationPersistsAllTargetsAndStopsCountingEarly(t *testing.T) 
 }
 
 func TestBatchPreflightFailuresNeverPartiallyDelete(t *testing.T) {
-	for _, kind := range []string{"反查缺失", "统计失败", "本地恢复", "根目录丢失", "监控停用", "重新保存配置", "取消上下文"} {
+	// 注：“反查缺失”（候选在云端已不存在）不在此列：那是“无需删除”而不是“不安全”，
+	// 现已改为跳过该候选继续处理（见 TestMissingCandidateIsSkippedInsteadOfAbortingBatch），
+	// 否则一条 404 会把整批反复重试并永久卡死。
+	for _, kind := range []string{"统计失败", "本地恢复", "根目录丢失", "监控停用", "重新保存配置", "取消上下文"} {
 		t.Run(kind, func(t *testing.T) {
 			s, files, task := newDeleteTestService(t, 10, StrategyBlock)
 			files.tree["root"] = []domain.FileItem{{ID: "a", Name: "A", IsDir: true}, {ID: "b", Name: "B", IsDir: true}}
 			files.tree["a"], files.tree["b"] = mediaItems(2), mediaItems(2)
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			if kind == "反查缺失" {
-				files.tree["root"] = files.tree["root"][:1]
-			}
 			files.beforeList = func(parent string) error {
 				if parent != "b" {
 					return nil
@@ -432,6 +432,31 @@ func TestBatchPreflightFailuresNeverPartiallyDelete(t *testing.T) {
 				t.Fatal("整批预检失败前已经删除部分目标")
 			}
 		})
+	}
+}
+
+func TestMissingCandidateIsSkippedInsteadOfAbortingBatch(t *testing.T) {
+	s, files, task := newDeleteTestService(t, 10, StrategyBlock)
+	// 云端只有 A；B 的候选路径在云端不存在（典型：别家程序在 STRM 目录里建过又删掉的临时目录）。
+	files.tree["root"] = []domain.FileItem{{ID: "a", Name: "A", IsDir: true}}
+	files.tree["a"] = mediaItems(2)
+
+	err := s.processCandidates(context.Background(), 1,
+		[]candidate{deletedDirectory(s, task, "A"), deletedDirectory(s, task, "B")})
+	if err != nil {
+		t.Fatalf("缺失候选应被跳过而不是中止整批: %v", err)
+	}
+	if len(files.deleted) != 1 || len(files.deleted[0]) != 1 || files.deleted[0][0] != "a" {
+		t.Fatalf("应只删除存在的 A，实际 %+v", files.deleted)
+	}
+
+	// 整批都是缺失候选时：不报错、不删除任何东西。
+	err = s.processCandidates(context.Background(), 1, []candidate{deletedDirectory(s, task, "C")})
+	if err != nil {
+		t.Fatalf("全部候选缺失时不应报错: %v", err)
+	}
+	if len(files.deleted) != 1 {
+		t.Fatalf("缺失候选不应产生删除调用，实际 %+v", files.deleted)
 	}
 }
 
@@ -639,5 +664,36 @@ func TestSubtreeRegistrationFailurePausesEntireWatcher(t *testing.T) {
 	}
 	if !s.paused || len(s.batches) != 0 || len(s.watched) != 0 {
 		t.Fatal("子目录无法监听时仍执行删除")
+	}
+}
+
+// 只有真 STRM 目录（出现过 *.strm）才具备联动删除资格。
+// 刮削工具在 STRM 目录里建/删的临时元数据目录常常只有 jpg/nfo，不能被当成
+// “用户删了 STRM”去删云端真实媒体。
+func TestDirHasStrmOnlyQualifiesRealStrmDirs(t *testing.T) {
+	base := t.TempDir()
+	withStrm := filepath.Join(base, "with-strm")
+	onlyMeta := filepath.Join(base, "only-meta")
+	for _, dir := range []string{withStrm, onlyMeta} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(withStrm, "X-1.strm"), []byte("http://x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"poster.jpg", "X-1.nfo"} {
+		if err := os.WriteFile(filepath.Join(onlyMeta, name), []byte("x"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !dirHasStrm(withStrm) {
+		t.Fatal("含 .strm 的目录应具备联动删除资格")
+	}
+	if dirHasStrm(onlyMeta) {
+		t.Fatal("只有图片/nfo 的目录不应具备联动删除资格")
+	}
+	if dirHasStrm(filepath.Join(base, "not-exist")) {
+		t.Fatal("不存在的目录不应具备资格")
 	}
 }

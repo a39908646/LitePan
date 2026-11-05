@@ -72,6 +72,14 @@ func (s *Service) processCandidates(ctx context.Context, taskID int64, items []c
 		rel = filepath.ToSlash(rel)
 		target, parentID, err := s.resolveTarget(ctx, task, rel, c.isDir, lists)
 		if err != nil {
+			// 云端本来就没有这个条目（常见于其它程序在 STRM 目录里建/删临时目录，
+			// 例如刮削工具写完图片又删掉目录）：跳过该候选继续处理后面的。
+			// 以前这里直接 return，一条 404 就把整批废掉，批次会被反复重试并永久卡死。
+			if ae, ok := domain.AsAppError(err); ok && ae.Code == domain.CodeNotFound {
+				s.log.Debug("STRM 删除候选在云端不存在，已跳过",
+					"task_id", task.ID, "relative", rel, "is_dir", c.isDir)
+				continue
+			}
 			return err
 		}
 		if seen[target.ID] {
