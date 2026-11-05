@@ -14,4 +14,5 @@ import (
 	_ "litepan/drivers/OpenList"
 	_ "litepan/drivers/Quark"
 	_ "litepan/drivers/WebDAV"
+	_ "litepan/drivers/halalcloud"
 )
