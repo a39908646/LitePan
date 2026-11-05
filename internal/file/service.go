@@ -427,15 +427,22 @@ func (s *Service) MoveAndRename(ctx context.Context, accountID int64, fileID, ol
 		if err := s.RenameFile(ctx, accountID, fileID, newName, targetParentID); err != nil {
 			return "", err
 		}
-		return s.findChildID(ctx, accountID, targetParentID, newName)
+		return s.findChildIDRetry(ctx, accountID, targetParentID, newName)
 	}
 
 	// 跨目录但文件名不变（或调用方拿不到原名）：只做移动，最后再按新名字校验。
 	if oldName == "" || oldName == newName {
 		if err := s.MoveFiles(ctx, accountID, []string{fileID}, targetParentID, sourceParentID); err != nil {
+			// 幂等兜底：调用方重试时，上一次移动其实已经完成，源已不在、目标里已有同名文件。
+			// 这种“移动报错但结果已就位”必须按成功返回，否则上层（FUSE/mdc）会一直重试到失败。
+			if id, ok := s.resolveMoved(ctx, accountID, targetParentID, newName); ok {
+				s.log.Info("移动报错但目标已就位，按成功处理",
+					"account_id", accountID, "parent_id", targetParentID, "name", newName, "err", err)
+				return id, nil
+			}
 			return "", err
 		}
-		newID, err := s.findChildID(ctx, accountID, targetParentID, newName)
+		newID, err := s.findChildIDRetry(ctx, accountID, targetParentID, newName)
 		if err != nil {
 			return "", domain.Errorf(domain.CodeDriverError, "移动后目标目录中找不到 %q", newName)
 		}
@@ -462,7 +469,7 @@ func (s *Service) MoveAndRename(ctx context.Context, accountID int64, fileID, ol
 		if err := s.MoveFiles(ctx, accountID, []string{fileID}, targetParentID, sourceParentID); err != nil {
 			return "", err
 		}
-		movedID, lookupErr := s.findChildID(ctx, accountID, targetParentID, oldName)
+		movedID, lookupErr := s.findChildIDRetry(ctx, accountID, targetParentID, oldName)
 		if lookupErr != nil {
 			// 定位不到就不要拿旧 ID 硬改（旧路径已失效），尽力移回源目录后报错。
 			s.rollbackMove(ctx, accountID, fileID, "", []string{oldName}, sourceParentID, targetParentID)
@@ -475,7 +482,7 @@ func (s *Service) MoveAndRename(ctx context.Context, accountID int64, fileID, ol
 	}
 
 	// 最终校验：目标目录里必须出现新名字，否则不把“成功”报给调用方。
-	newID, err := s.findChildID(ctx, accountID, targetParentID, newName)
+	newID, err := s.findChildIDRetry(ctx, accountID, targetParentID, newName)
 	if err != nil {
 		s.log.Error("移动+改名后校验失败",
 			"account_id", accountID,
@@ -501,6 +508,45 @@ func (s *Service) MoveAndRename(ctx context.Context, accountID int64, fileID, ol
 		})
 	}
 	return newID, nil
+}
+
+// findChildIDRetry 是 findChildID 的容错版本。
+//
+// 网盘列表普遍存在最终一致性：移动/改名刚返回成功时，即使强制刷新也可能还看不到新条目。
+// 只查一次就判定“没找到”，会把已经成功完成的移动报成失败——上层（FUSE 的 rename、
+// mdc 的整理流程）随后重试时源已不在，于是又变成 ENOENT，最终表现为“一堆失败但文件其实动了”。
+// 这里按短退避多查几次，给列表一点追平的时间。
+func (s *Service) findChildIDRetry(ctx context.Context, accountID int64, parentID, name string) (string, error) {
+	delays := []time.Duration{0, 200 * time.Millisecond, 600 * time.Millisecond, 1500 * time.Millisecond}
+	var lastErr error
+	for _, delay := range delays {
+		if delay > 0 {
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-time.After(delay):
+			}
+		}
+		id, err := s.findChildID(ctx, accountID, parentID, name)
+		if err == nil {
+			return id, nil
+		}
+		lastErr = err
+	}
+	return "", lastErr
+}
+
+// resolveMoved 在移动调用报错后确认目标目录里是否已经有同名文件：
+// 有则说明这次移动的结果其实已经存在（重试场景），可以按成功返回。
+func (s *Service) resolveMoved(ctx context.Context, accountID int64, targetParentID, name string) (string, bool) {
+	if strings.TrimSpace(name) == "" {
+		return "", false
+	}
+	id, err := s.findChildID(ctx, accountID, targetParentID, name)
+	if err != nil {
+		return "", false
+	}
+	return id, true
 }
 
 // findChildID 在指定目录里按名字查真实 fileID。强制刷新，确保看到刚发生的改动

@@ -427,7 +427,12 @@ func (d *cloudDir) lookupChildItem(ctx context.Context, name string) (domain.Fil
 }
 
 func (d *cloudDir) lookupChildItemIfExists(ctx context.Context, name string) (domain.FileItem, bool, syscall.Errno) {
-	items, err := d.b.deps.Files.List(ctx, d.b.accountID(), d.item.ID, false)
+	return d.lookupChildItemIfExistsOpt(ctx, name, false)
+}
+
+// lookupChildItemIfExistsOpt 允许指定是否强制刷新网盘列表（跳过本地缓存）。
+func (d *cloudDir) lookupChildItemIfExistsOpt(ctx context.Context, name string, forceRefresh bool) (domain.FileItem, bool, syscall.Errno) {
+	items, err := d.b.deps.Files.List(ctx, d.b.accountID(), d.item.ID, forceRefresh)
 	if err != nil {
 		return domain.FileItem{}, false, errnoFor(err)
 	}
@@ -454,8 +459,20 @@ func (d *cloudDir) healStaleChild(ctx context.Context, name string, freshAt time
 	if !freshAt.IsZero() && time.Since(freshAt) < staleGrace {
 		return 0
 	}
-	_, found, errno := d.lookupChildItemIfExists(ctx, name)
+	// 必须强制刷新：新建目录可能还没进本地缓存，拿缓存判定会把健康节点当幽灵删掉，
+	// 后续 rename / lookup 直接 ENOENT（mdc 一类外部工具的整理流程就是这样炸的）。
+	_, found, errno := d.lookupChildItemIfExistsOpt(ctx, name, true)
 	// 列表本身失败（驱动抖动/网络）不能当作条目不存在，否则会误删健康节点。
+	if errno != 0 || found {
+		return 0
+	}
+	// 强制刷新也看不到，再给列表一点追平时间后复查一次，避免最终一致性误删。
+	select {
+	case <-ctx.Done():
+		return 0
+	case <-time.After(300 * time.Millisecond):
+	}
+	_, found, errno = d.lookupChildItemIfExistsOpt(ctx, name, true)
 	if errno != 0 || found {
 		return 0
 	}

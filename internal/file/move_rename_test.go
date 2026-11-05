@@ -18,6 +18,11 @@ type memFSDriver struct {
 	renames    []string
 	renameNoop bool  // 模拟「改名接口返回成功，但云端其实没改」
 	renameErr  error // 模拟改名接口直接报错
+
+	// listLag 模拟网盘列表的最终一致性：移动完成后的一段时间里，
+	// 目标目录的列表仍然是移动前的快照。
+	listLag  int
+	staleFor map[string][]domain.FileItem
 }
 
 func newMemFSDriver() *memFSDriver {
@@ -34,11 +39,23 @@ func (d *memFSDriver) Drop(context.Context) error { return nil }
 func (d *memFSDriver) Ping(context.Context) error { return nil }
 
 func (d *memFSDriver) ListFiles(_ context.Context, parentID string) ([]domain.FileItem, error) {
+	if d.listLag > 0 {
+		if stale, ok := d.staleFor[parentID]; ok {
+			d.listLag--
+			return append([]domain.FileItem(nil), stale...), nil
+		}
+	}
 	return append([]domain.FileItem(nil), d.dirs[parentID]...), nil
 }
 
 func (d *memFSDriver) MoveFiles(_ context.Context, fileIDs []string, targetParentID, sourceParentID string) error {
 	d.moves++
+	if d.listLag > 0 {
+		if d.staleFor == nil {
+			d.staleFor = map[string][]domain.FileItem{}
+		}
+		d.staleFor[targetParentID] = append([]domain.FileItem(nil), d.dirs[targetParentID]...)
+	}
 	for _, id := range fileIDs {
 		idx := indexOf(d.dirs[sourceParentID], id)
 		if idx < 0 {
@@ -215,5 +232,44 @@ func TestMoveAndRenameSameParentOnlyRenames(t *testing.T) {
 	}
 	if newID != "/src/c.mp4" {
 		t.Fatalf("newID = %q, want /src/c.mp4", newID)
+	}
+}
+
+// 回归：移动成功后，目标目录的列表可能还没追平（最终一致性）。
+// 修复前只查一次列表就判定失败，会把已经完成的移动报成 ENOENT；
+// 上层（mdc）重试时源已不在，最终表现成一整片"失败"。
+func TestMoveAndRenameToleratesLaggingList(t *testing.T) {
+	drv := newMemFSDriver()
+	drv.listLag = 3
+	svc := newMemService(drv)
+
+	newID, err := svc.MoveAndRename(context.Background(), 1, "/src/a.mp4", "a.mp4", "/src", "/dst", "a.mp4")
+	if err != nil {
+		t.Fatalf("列表暂时滞后不应判定为失败，实际 error = %v", err)
+	}
+	if newID != "/dst/a.mp4" {
+		t.Fatalf("newID = %q, want /dst/a.mp4", newID)
+	}
+}
+
+// 回归：调用方重试时，上一次移动其实已经成功，源已不存在。
+// 此时再移动必然 not found，但目标里已有同名文件，应幂等返回成功，
+// 否则 FUSE/mdc 会一直重试到彻底失败。
+func TestMoveAndRenameIdempotentWhenAlreadyMoved(t *testing.T) {
+	drv := newMemFSDriver()
+	svc := newMemService(drv)
+
+	// 先手工完成一次移动（模拟上一次请求成功但响应丢失）。
+	item := drv.dirs["/src"][0]
+	drv.dirs["/src"] = nil
+	item.ID = "/dst/a.mp4"
+	drv.dirs["/dst"] = []domain.FileItem{item}
+
+	newID, err := svc.MoveAndRename(context.Background(), 1, "/src/a.mp4", "a.mp4", "/src", "/dst", "a.mp4")
+	if err != nil {
+		t.Fatalf("源已移走但目标已就位时应幂等成功，实际 error = %v", err)
+	}
+	if newID != "/dst/a.mp4" {
+		t.Fatalf("newID = %q, want /dst/a.mp4", newID)
 	}
 }
