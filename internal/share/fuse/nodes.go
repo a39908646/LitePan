@@ -227,16 +227,33 @@ func (d *cloudDir) Rename(ctx context.Context, name string, newParent fs.InodeEm
 		case *stagingFile:
 			return d.renameStaging(ctx, n, targetDir, newName)
 		case *cloudDir:
-			return d.renameRemote(ctx, n.item, targetDir, newName)
+			return d.renameNode(ctx, &n.item, targetDir, newName)
 		case *cloudFile:
-			return d.renameRemote(ctx, n.item, targetDir, newName)
+			return d.renameNode(ctx, &n.item, targetDir, newName)
 		}
 	}
 	item, errno := d.lookupChildItem(ctx, name)
 	if errno != 0 {
 		return errno
 	}
-	return d.renameRemote(ctx, item, targetDir, newName)
+	return d.renameNode(ctx, &item, targetDir, newName)
+}
+
+// renameNode 执行重命名，并把客户端的节点状态对齐到服务端结果。
+//
+// 更新 item 是必须的：IDPath 驱动（如 WebDAV / OpenList）的 fileID 就是路径，
+// 移动或改名之后旧 ID 立即失效；不更新就会让后续 stat/open 拿着不存在的旧路径
+// 去请求，表现为幽灵条目 / EEXIST / ENOENT。“成功”必须意味着本地状态与云端一致。
+func (d *cloudDir) renameNode(ctx context.Context, item *domain.FileItem, targetDir *cloudDir, newName string) syscall.Errno {
+	newID, errno := d.renameRemote(ctx, *item, targetDir, newName)
+	if errno != 0 {
+		return errno
+	}
+	if newID != "" {
+		item.ID = newID
+	}
+	item.Name = newName
+	return 0
 }
 
 // renameStaging 处理本会话内刚创建、尚未在网盘列表可见的 staging 文件改名：
@@ -276,40 +293,48 @@ func (d *cloudDir) renameStaging(ctx context.Context, st *stagingFile, targetDir
 	return 0
 }
 
-// renameRemote 对网盘上已存在的文件或目录执行移动与改名。
-func (d *cloudDir) renameRemote(ctx context.Context, item domain.FileItem, targetDir *cloudDir, newName string) syscall.Errno {
+// renameRemote 对网盘上已存在的文件或目录执行移动与改名，返回最新 fileID。
+func (d *cloudDir) renameRemote(ctx context.Context, item domain.FileItem, targetDir *cloudDir, newName string) (string, syscall.Errno) {
 	if targetDir.item.ID == d.item.ID && item.Name == newName {
-		return 0
+		return item.ID, 0
 	}
+	// 把目录移到它自己上：直接拒绝，不要落到下面的移动分支（那样会把目录搬进自己里）。
 	if item.IsDir && targetDir.item.ID == item.ID {
-		return syscall.EINVAL
+		return "", syscall.EINVAL
 	}
 	if targetDir.item.ID != d.item.ID {
-		if err := d.b.deps.Files.MoveFiles(ctx, d.b.accountID(), []string{item.ID}, targetDir.item.ID, d.item.ID); err != nil {
-			return errnoFor(err)
+		// 跨目录（可同时改名）：交给 file.Service 统一处理——用移动后的新 ID 改名、
+		// 校验最终文件名、失败回滚。这里不能自己拼接两步：IDPath 驱动移动后旧 ID 已失效，
+		// 那时候再拿旧 ID 去改名只会白跑一趟，而返回值才是调用方唯一的依据。
+		newID, err := d.b.deps.Files.MoveAndRename(ctx, d.b.accountID(), item.ID, item.Name, d.item.ID, targetDir.item.ID, newName)
+		if err != nil {
+			return "", errnoFor(err)
 		}
-		if newName != item.Name {
-			if err := d.b.deps.Files.RenameFile(ctx, d.b.accountID(), item.ID, newName, targetDir.item.ID); err != nil {
-				if rollbackErr := d.b.deps.Files.MoveFiles(ctx, d.b.accountID(), []string{item.ID}, d.item.ID, targetDir.item.ID); rollbackErr != nil && d.b.deps.Log != nil {
-					d.b.deps.Log.Error("FUSE move+rename 回滚失败",
-						"account_id", d.b.accountID(),
-						"file_id", item.ID,
-						"source_parent_id", d.item.ID,
-						"target_parent_id", targetDir.item.ID,
-						"target_name", newName,
-						"rename_err", err,
-						"rollback_err", rollbackErr,
-					)
-				}
-				return errnoFor(err)
-			}
-		}
-		return 0
+		return newID, 0
 	}
+	// 同目录：只改名。
 	if err := d.b.deps.Files.RenameFile(ctx, d.b.accountID(), item.ID, newName, d.item.ID); err != nil {
-		return errnoFor(err)
+		return "", errnoFor(err)
 	}
-	return 0
+	return d.resolveChildID(ctx, item, newName), 0
+}
+
+// resolveChildID 在改名后解析子项的新 fileID。IDPath 驱动的路径 ID 随名字变化，
+// 必须回查；IDStable 驱动直接沿用原 ID。
+func (d *cloudDir) resolveChildID(ctx context.Context, item domain.FileItem, name string) string {
+	if item.IDKind != domain.IDPath {
+		return item.ID
+	}
+	items, err := d.b.deps.Files.List(ctx, d.b.accountID(), d.item.ID, true)
+	if err != nil {
+		return ""
+	}
+	for _, it := range items {
+		if it.Name == name {
+			return it.ID
+		}
+	}
+	return ""
 }
 
 // unlinkStaging 删除本会话内刚创建、尚未在网盘列表可见的 staging 文件：

@@ -337,6 +337,11 @@ func (s *Service) MoveFiles(ctx context.Context, accountID int64, fileIDs []stri
 		s.log.Warn("移动文件失败", "account_id", accountID, "count", len(fileIDs), "err", err)
 		return err
 	}
+	// 移动后源目录与目标目录的列表都变了，必须失效，否则 FUSE / API 会拿到陈旧列表。
+	if s.cache != nil {
+		cache.InvalidateDirKeys(s.cache, accountID, sourceParentID)
+		cache.InvalidateDirKeys(s.cache, accountID, targetParentID)
+	}
 	s.log.Debug("移动文件成功", "account_id", accountID, "count", len(fileIDs), "source", sourceParentID, "target", targetParentID)
 	s.publishMutation(ctx, eventbus.FileMutated{
 		AccountID:   accountID,
@@ -385,9 +390,172 @@ func (s *Service) RenameFile(ctx context.Context, accountID int64, fileID, newNa
 		s.log.Warn("重命名失败", "account_id", accountID, "file_id", fileID, "new_name", newName, "err", err)
 		return err
 	}
+	if s.cache != nil && parentID != "" {
+		cache.InvalidateDirKeys(s.cache, accountID, parentID)
+	}
 	s.log.Debug("重命名成功", "account_id", accountID, "file_id", fileID, "new_name", newName)
 	s.publishMutation(ctx, eventbus.FileMutated{AccountID: accountID, Op: "rename", ParentID: parentID, FileID: fileID})
 	return nil
+}
+
+// MoveAndRename 跨目录移动并同时改名，返回改名后的最新 fileID。
+//
+// 为什么不能用 MoveFiles + RenameFile 简单拼接：IDPath 驱动（WebDAV / OpenList 等）的
+// fileID 就是路径，MoveFiles 之后旧 fileID 立即失效。拿移动前的 ID 去 RenameFile，
+// 改名这步必然失败；一旦上层把错误当成“改名没做成但文件已移走”而没往上抛，
+// 调用方就会拿到“成功”，实际只移动没改名。
+//
+// 顺序：优先驱动原生单步能力 → 否则“移动(保持原名) → 按目标目录重新定位新 ID → 改名”，
+// 最后统一校验目标目录里确实出现新名字；校验不过就回滚并返回错误，绝不假成功。
+func (s *Service) MoveAndRename(ctx context.Context, accountID int64, fileID, oldName, sourceParentID, targetParentID, newName string) (string, error) {
+	sourceParentID = cache.NormalizeDirParentID(sourceParentID)
+	targetParentID = cache.NormalizeDirParentID(targetParentID)
+	oldName = strings.TrimSpace(oldName)
+	newName = strings.TrimSpace(newName)
+	if strings.TrimSpace(fileID) == "" {
+		return "", domain.Errorf(domain.CodeValidation, "缺少文件 ID")
+	}
+	if newName == "" {
+		return "", domain.Errorf(domain.CodeValidation, "新名称不能为空")
+	}
+	if err := s.exec.Check(ctx, accountID); err != nil {
+		return "", err
+	}
+
+	// 同目录：只是改名，不需要移动。
+	if sourceParentID == targetParentID {
+		if err := s.RenameFile(ctx, accountID, fileID, newName, targetParentID); err != nil {
+			return "", err
+		}
+		return s.findChildID(ctx, accountID, targetParentID, newName)
+	}
+
+	// 跨目录但文件名不变（或调用方拿不到原名）：只做移动，最后再按新名字校验。
+	if oldName == "" || oldName == newName {
+		if err := s.MoveFiles(ctx, accountID, []string{fileID}, targetParentID, sourceParentID); err != nil {
+			return "", err
+		}
+		newID, err := s.findChildID(ctx, accountID, targetParentID, newName)
+		if err != nil {
+			return "", domain.Errorf(domain.CodeDriverError, "移动后目标目录中找不到 %q", newName)
+		}
+		return newID, nil
+	}
+
+	// 跨目录 + 改名：优先用驱动原生单步能力（一条 MOVE 完成，没有中间态）。
+	singleShot := false
+	if err := s.exec.Run(ctx, accountID, func(drv driver.Driver) error {
+		mr, ok := drv.(driver.MoveRenamer)
+		if !ok {
+			return nil
+		}
+		singleShot = true
+		return mr.MoveAndRename(ctx, fileID, targetParentID, newName)
+	}); err != nil {
+		s.log.Warn("移动+改名失败", "account_id", accountID, "file_id", fileID, "old_name", oldName, "new_name", newName, "err", err)
+		s.invalidateDirs(accountID, sourceParentID, targetParentID)
+		return "", err
+	}
+
+	if !singleShot {
+		// 回退实现：先移动（保持原名），再用移动后的真实 ID 改名。
+		if err := s.MoveFiles(ctx, accountID, []string{fileID}, targetParentID, sourceParentID); err != nil {
+			return "", err
+		}
+		movedID, lookupErr := s.findChildID(ctx, accountID, targetParentID, oldName)
+		if lookupErr != nil {
+			// 定位不到就不要拿旧 ID 硬改（旧路径已失效），尽力移回源目录后报错。
+			s.rollbackMove(ctx, accountID, fileID, "", []string{oldName}, sourceParentID, targetParentID)
+			return "", domain.Errorf(domain.CodeDriverError, "移动后未能在目标目录定位到 %q：%v", oldName, lookupErr)
+		}
+		if err := s.RenameFile(ctx, accountID, movedID, newName, targetParentID); err != nil {
+			s.rollbackMove(ctx, accountID, movedID, movedID, []string{oldName}, sourceParentID, targetParentID)
+			return "", err
+		}
+	}
+
+	// 最终校验：目标目录里必须出现新名字，否则不把“成功”报给调用方。
+	newID, err := s.findChildID(ctx, accountID, targetParentID, newName)
+	if err != nil {
+		s.log.Error("移动+改名后校验失败",
+			"account_id", accountID,
+			"file_id", fileID,
+			"old_name", oldName,
+			"new_name", newName,
+			"target_parent_id", targetParentID,
+			"single_shot", singleShot,
+		)
+		s.rollbackMove(ctx, accountID, fileID, "", []string{newName, oldName}, sourceParentID, targetParentID)
+		return "", domain.Errorf(domain.CodeDriverError, "移动+改名未生效：目标目录中找不到 %q", newName)
+	}
+
+	s.log.Debug("移动+改名成功", "account_id", accountID, "file_id", fileID, "new_id", newID, "new_name", newName, "target", targetParentID)
+	if singleShot {
+		// 回退路径的 MoveFiles / RenameFile 已各自发过事件，单步路径需要补一条。
+		s.publishMutation(ctx, eventbus.FileMutated{
+			AccountID:   accountID,
+			Op:          "move",
+			ParentID:    targetParentID,
+			OldParentID: sourceParentID,
+			FileIDs:     []string{newID},
+		})
+	}
+	return newID, nil
+}
+
+// findChildID 在指定目录里按名字查真实 fileID。强制刷新，确保看到刚发生的改动
+// （IDPath 驱动的路径 ID 在移动/改名后会变，不能拿旧 ID 当新 ID 用）。
+func (s *Service) findChildID(ctx context.Context, accountID int64, parentID, name string) (string, error) {
+	items, err := s.List(ctx, accountID, parentID, true)
+	if err != nil {
+		return "", err
+	}
+	for _, it := range items {
+		if it.Name == name {
+			return it.ID, nil
+		}
+	}
+	return "", domain.Errorf(domain.CodeNotFound, "目标目录中没有 %q", name)
+}
+
+// rollbackMove 尽力把文件移回源目录；失败只记日志，不覆盖原始错误。
+//
+// candidateNames 按顺序尝试：改名没生效时目标目录里还是旧名字，
+// 只看新名字会定位不到，回滚就会白跑一趟。
+func (s *Service) rollbackMove(ctx context.Context, accountID int64, fileID, idInTarget string, candidateNames []string, sourceParentID, targetParentID string) {
+	id := strings.TrimSpace(idInTarget)
+	if id == "" {
+		for _, name := range candidateNames {
+			if name == "" {
+				continue
+			}
+			if resolved, err := s.findChildID(ctx, accountID, targetParentID, name); err == nil {
+				id = resolved
+				break
+			}
+		}
+	}
+	if id == "" {
+		id = fileID
+	}
+	if err := s.MoveFiles(ctx, accountID, []string{id}, sourceParentID, targetParentID); err != nil {
+		s.log.Error("FUSE move+rename 回滚失败",
+			"account_id", accountID,
+			"file_id", id,
+			"source_parent_id", sourceParentID,
+			"target_parent_id", targetParentID,
+			"err", err,
+		)
+	}
+}
+
+func (s *Service) invalidateDirs(accountID int64, parentIDs ...string) {
+	if s.cache == nil {
+		return
+	}
+	for _, id := range parentIDs {
+		cache.InvalidateDirKeys(s.cache, accountID, id)
+	}
 }
 
 func (s *Service) CreateFolder(ctx context.Context, accountID int64, parentID, name string) (*domain.FileItem, error) {

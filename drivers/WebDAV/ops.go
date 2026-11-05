@@ -364,3 +364,29 @@ func (d *Driver) RenameFile(ctx context.Context, fileID, newName string) error {
 	}
 	return nil
 }
+
+// MoveAndRename 用一条 MOVE 完成「跨目录 + 改名」：Destination 直接指向目标父目录下的新文件名。
+//
+// 先前组合实现的问题：先 MoveFiles 把文件移到目标目录（保持原名），再以「移动前的"
+// fileID 调 RenameFile —— 此时源路径已不存在，改名必然失败；一旦调用方没把错误向上报，
+// 就变成「只移动、没改名，却返回成功」。
+func (d *Driver) MoveAndRename(ctx context.Context, fileID, targetParentID, newName string) error {
+	src := d.normalizePath(fileID)
+	if src == d.rootPath() {
+		return domain.Errorf(domain.CodeValidation, "根目录不支持移动")
+	}
+	name := strings.TrimSpace(newName)
+	if name == "" || strings.Contains(name, "/") {
+		return domain.Errorf(domain.CodeValidation, "新名称不合法：%q", newName)
+	}
+	dst := d.childPath(d.normalizePath(targetParentID), name)
+	c, err := d.ensureClient()
+	if err != nil {
+		return err
+	}
+	_ = ctx
+	if err := c.Rename(src, dst, true); err != nil {
+		return mapError(err)
+	}
+	return nil
+}

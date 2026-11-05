@@ -119,6 +119,15 @@ type Renamer interface {
 	RenameFile(ctx context.Context, fileID, newName string) error
 }
 
+// MoveRenamer 可选：驱动原生支持「一次操作完成跨目录移动 + 改名」。
+//
+// 对 IDPath 驱动（fileID 就是路径）尤其重要：先 MoveFiles 再 RenameFile 时，
+// 移动之后旧 fileID 立即失效，第二次调用要么报错、要么静默不生效。
+// 实现此接口可以避开中间态与第二次往返。
+type MoveRenamer interface {
+	MoveAndRename(ctx context.Context, fileID, targetParentID, newName string) error
+}
+
 type FolderCreator interface {
 	CreateFolder(ctx context.Context, parentID, name string) (*domain.FileItem, error)
 }
