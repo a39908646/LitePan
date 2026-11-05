@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -66,9 +67,17 @@ func (d *Driver) UploadLocalFile(ctx context.Context, req driver.LocalUploadRequ
 		Size:     size,
 	}
 	if task.Created {
-		uploadutil.NotifyProgress(req.OnProgress, size, size, "秒传成功")
-		result.Message = "秒传成功（服务端已存在相同内容）"
-		return result, nil
+		// Created=true 只说明服务端已有同名条目，不保证内容是对的：
+		// 上一次 makeFile 失败会留下 0 字节占位，重试时服务端就回 Created=true。
+		// 所以必须回读确认大小，不一致就继续走正常分块上传把它覆盖掉。
+		if existing, err := d.files.Get(ctx, &sdkUserFile.File{Path: targetPath}); err == nil && existing != nil && existing.Size == size {
+			uploadutil.NotifyProgress(req.OnProgress, size, size, "秒传成功")
+			result.Message = "秒传成功（服务端已存在相同内容）"
+			if strings.TrimSpace(existing.Path) != "" {
+				result.FileID = existing.Path
+			}
+			return result, nil
+		}
 	}
 
 	blockSize := task.BlockSize
@@ -199,8 +208,41 @@ func (d *Driver) probeSlice(ctx context.Context, client *http.Client, endpoint s
 	return hit, nil
 }
 
+// makeFileResult 是 makeFile 的响应。
+//
+// 不能直接反序列化到 sdkUserFile.File：SDK 把 size 声明成 json:",string"，
+// 而该接口实际返回的是原始数字，会报 "cannot unmarshal number into ... size of type int64"。
+type makeFileResult struct {
+	Identity        string   `json:"identity"`
+	Path            string   `json:"path"`
+	Size            flexInt  `json:"size"`
+	ContentIdentity string   `json:"content_identity"`
+}
+
+// flexInt 兼容 JSON 里数字与字符串两种编码。
+type flexInt int64
+
+func (f *flexInt) UnmarshalJSON(raw []byte) error {
+	text := strings.Trim(strings.TrimSpace(string(raw)), `"`)
+	if text == "" || text == "null" {
+		*f = 0
+		return nil
+	}
+	value, err := strconv.ParseInt(text, 10, 64)
+	if err != nil {
+		// 允许小数形式（部分接口会给 float）
+		floatValue, floatErr := strconv.ParseFloat(text, 64)
+		if floatErr != nil {
+			return err
+		}
+		value = int64(floatValue)
+	}
+	*f = flexInt(value)
+	return nil
+}
+
 // makeFile 用分块 CID 列表收尾，生成正式文件。
-func (d *Driver) makeFile(ctx context.Context, uploadAddress, taskID string, slices []string) (*sdkUserFile.File, error) {
+func (d *Driver) makeFile(ctx context.Context, uploadAddress, taskID string, slices []string) (*makeFileResult, error) {
 	endpoint := fmt.Sprintf("%s/%s", strings.TrimSuffix(uploadAddress, "/"), taskID)
 	payload, err := json.Marshal(slices)
 	if err != nil {
@@ -224,9 +266,9 @@ func (d *Driver) makeFile(ctx context.Context, uploadAddress, taskID string, sli
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 			resp.Body.Close()
 			if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
-				var out sdkUserFile.File
+				var out makeFileResult
 				if err := json.Unmarshal(body, &out); err != nil {
-					return nil, domain.Errorf(domain.CodeDriverError, "解析 makeFile 响应失败：%v", err)
+					return nil, domain.Errorf(domain.CodeDriverError, "解析 makeFile 响应失败：%v（原始响应：%s）", err, truncateForError(body))
 				}
 				return &out, nil
 			}
@@ -237,4 +279,13 @@ func (d *Driver) makeFile(ctx context.Context, uploadAddress, taskID string, sli
 		time.Sleep(sliceRetryPeriod)
 	}
 	return nil, lastErr
+}
+
+// truncateForError 截断响应体，避免把整个二进制塞进错误信息。
+func truncateForError(raw []byte) string {
+	text := strings.TrimSpace(string(raw))
+	if len(text) > 200 {
+		return text[:200] + "..."
+	}
+	return text
 }

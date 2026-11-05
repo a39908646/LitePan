@@ -95,62 +95,105 @@ func TestLiveSmoke(t *testing.T) {
 		t.Logf("已清理测试目录 %s（进回收站）", cleanupDir)
 	}()
 
-	// 上传 1KB
-	tmp := filepath.Join(t.TempDir(), "probe.txt")
-	payload := make([]byte, 1024)
+	// ① 多分块上传：12MB > 单块(通常 4MB)，验证分块循环与 makeFile 多 CID 收尾
+	big := filepath.Join(t.TempDir(), "big.bin")
+	payload := make([]byte, 12<<20)
 	for i := range payload {
-		payload[i] = byte('a' + i%26)
+		payload[i] = byte((i*7 + 13) % 251)
 	}
-	if err := os.WriteFile(tmp, payload, 0o644); err != nil {
+	if err := os.WriteFile(big, payload, 0o644); err != nil {
 		t.Fatalf("写本地临时文件失败: %v", err)
 	}
-	res, err := d.UploadLocalFile(ctx, localUpload(tmp, "probe.txt", created.ID))
+	start := time.Now()
+	res, err := d.UploadLocalFile(ctx, localUpload(big, "big.bin", created.ID))
+	firstCost := time.Since(start)
 	if err != nil {
-		t.Fatalf("UploadLocalFile 失败: %v", err)
+		t.Fatalf("UploadLocalFile（多分块 12MB）失败: %v", err)
 	}
-	t.Logf("上传成功: id=%q size=%d msg=%q", res.FileID, res.Size, res.Message)
+	t.Logf("多分块上传成功: id=%q size=%d 耗时 %v", res.FileID, res.Size, firstCost.Round(time.Millisecond))
 
-	// 回读确认
+	// ② 回读确认大小
 	list, err := d.ListFiles(ctx, created.ID)
 	if err != nil {
 		t.Fatalf("回读测试目录失败: %v", err)
 	}
-	found := false
+	bigID := ""
 	for _, it := range list {
-		if it.Name == "probe.txt" {
-			found = true
-			t.Logf("回读命中: size=%d（期望 1024）", it.Size)
-			if it.Size != 1024 {
-				t.Errorf("文件大小不符: got %d want 1024", it.Size)
+		if it.Name == "big.bin" {
+			bigID = it.ID
+			t.Logf("回读命中: size=%d（期望 %d）", it.Size, len(payload))
+			if it.Size != int64(len(payload)) {
+				t.Errorf("文件大小不符: got %d want %d", it.Size, len(payload))
 			}
 		}
 	}
-	if !found {
-		t.Fatalf("上传后列表里没有 probe.txt，实际: %v", list)
+	if bigID == "" {
+		t.Fatalf("上传后列表里没有 big.bin，实际: %v", list)
 	}
 
-	// 直链
-	info, err := d.ResolveDownload(ctx, downloadReq(res.FileID))
+	// ③ 改名
+	if err := d.RenameFile(ctx, bigID, "big-renamed.bin"); err != nil {
+		t.Errorf("RenameFile 失败: %v", err)
+	} else if items, err := d.ListFiles(ctx, created.ID); err != nil {
+		t.Errorf("改名后回读失败: %v", err)
+	} else {
+		renamed, hasOld := "", false
+		for _, it := range items {
+			switch it.Name {
+			case "big-renamed.bin":
+				renamed = it.ID
+			case "big.bin":
+				hasOld = true
+			}
+		}
+		if renamed == "" || hasOld {
+			t.Errorf("改名结果不符: renamed=%q oldStillThere=%v", renamed, hasOld)
+		} else {
+			t.Logf("RenameFile 成功: %s", renamed)
+			bigID = renamed
+		}
+	}
+
+	// ④ 复制到同一目录（验证 Copy 接口）
+	if err := d.CopyFiles(ctx, []string{bigID}, created.ID); err != nil {
+		t.Errorf("CopyFiles 失败: %v", err)
+	} else {
+		t.Logf("CopyFiles 成功")
+	}
+
+	// ⑤ 直链
+	info, err := d.ResolveDownload(ctx, downloadReq(bigID))
 	if err != nil {
 		t.Errorf("ResolveDownload 失败: %v", err)
+	} else if info == nil || info.URL == "" {
+		t.Errorf("ResolveDownload 返回空地址")
 	} else {
-		host := info.URL
-		if len(host) > 60 {
-			host = host[:60] + "..."
+		short := info.URL
+		if len(short) > 60 {
+			short = short[:60] + "..."
 		}
-		t.Logf("直链获取成功: %s（过期 %v）", host, info.Expiration)
+		t.Logf("直链获取成功: %s（过期 %v）", short, info.Expiration)
 	}
 
-	// 秒传验证：同样内容再传一次，服务端已有相同 CID 应当零传输
-	if err := os.WriteFile(tmp, payload, 0o644); err != nil {
+	// ⑥ 秒传：同样内容再传一次，服务端已有相同 CID 应零传输
+	if err := os.WriteFile(big, payload, 0o644); err != nil {
 		t.Fatalf("重写本地文件失败: %v", err)
 	}
-	start := time.Now()
-	if _, err := d.UploadLocalFile(ctx, localUpload(tmp, "probe-second.txt", created.ID)); err != nil {
+	start = time.Now()
+	if _, err := d.UploadLocalFile(ctx, localUpload(big, "big-second.bin", created.ID)); err != nil {
 		t.Errorf("第二次上传失败: %v", err)
 	} else {
-		t.Logf("第二次上传（同内容）耗时 %v —— 若明显低于首次即为秒传生效", time.Since(start).Round(time.Millisecond))
+		second := time.Since(start)
+		t.Logf("第二次上传（同内容 12MB）耗时 %v，首次 %v", second.Round(time.Millisecond), firstCost.Round(time.Millisecond))
 	}
+
+	// ⑦ 删除单个文件（进回收站）
+	if err := d.DeleteFiles(ctx, []string{bigID}); err != nil {
+		t.Errorf("DeleteFiles 失败: %v", err)
+	} else {
+		t.Logf("DeleteFiles 成功（进回收站）")
+	}
+
 	fmt.Println("SMOKE OK")
 }
 
