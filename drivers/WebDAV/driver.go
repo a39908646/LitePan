@@ -16,10 +16,9 @@ import (
 type Driver struct {
 	add Addition
 
-	client       *gowebdav.Client
-	uploadClient *gowebdav.Client
-	uploadHTTP   *http.Client
-	probe        *http.Client
+	client     *gowebdav.Client
+	uploadHTTP *http.Client
+	probe      *http.Client
 }
 
 var config = driver.Config{
@@ -63,12 +62,9 @@ func (d *Driver) Init(ctx context.Context) error {
 		c.SetTransport(buildTransport(d.add))
 	}
 	d.client = c
+	// 上传走自己的 HTTP 客户端：流式发送（不把整文件读进内存）+ 失败时能拿到响应正文。
 	uploadHTTP := httpx.NewUploadClient(&http.Client{Transport: buildTransport(d.add)}, 0, config.UploadUseHTTP2)
-	uploadClient := gowebdav.NewAuthClient(addr, gowebdav.NewAutoAuth(d.add.Username, d.add.Password))
-	uploadClient.SetTimeout(secondsOr(d.add.Timeout, defaultTimeout))
-	uploadClient.SetHeader("User-Agent", httpx.DefaultUserAgent)
-	uploadClient.SetTransport(uploadHTTP.Transport)
-	d.uploadClient = uploadClient
+	uploadHTTP.Timeout = secondsOr(d.add.Timeout, defaultTimeout)
 	d.uploadHTTP = uploadHTTP
 	d.probe = &http.Client{
 		Transport:     buildTransport(d.add),
@@ -83,7 +79,6 @@ func (d *Driver) Drop(context.Context) error {
 	httpx.CloseClient(d.probe)
 	httpx.CloseClient(d.uploadHTTP)
 	d.client = nil
-	d.uploadClient = nil
 	d.uploadHTTP = nil
 	d.probe = nil
 	return nil
@@ -182,13 +177,6 @@ func (d *Driver) ensureClient() (*gowebdav.Client, error) {
 		return nil, domain.Errorf(domain.CodeInternal, "WebDAV 客户端未初始化")
 	}
 	return d.client, nil
-}
-
-func (d *Driver) ensureUploadClient() (*gowebdav.Client, error) {
-	if d.uploadClient == nil {
-		return nil, domain.Errorf(domain.CodeInternal, "WebDAV 上传客户端未初始化")
-	}
-	return d.uploadClient, nil
 }
 
 // webdavPath 从 os.FileInfo 中提取 gowebdav File 的完整路径（若可获取）。

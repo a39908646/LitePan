@@ -3,12 +3,15 @@ package webdav
 import (
 	"context"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"strings"
 
 	"litepan/internal/domain"
 	"litepan/internal/driver"
 	"litepan/internal/driver/uploadutil"
+	"litepan/internal/httpx"
 )
 
 func (d *Driver) UploadLocalFile(ctx context.Context, req driver.LocalUploadRequest) (*driver.LocalUploadResult, error) {
@@ -44,12 +47,7 @@ func (d *Driver) UploadLocalFile(ctx context.Context, req driver.LocalUploadRequ
 	targetName = resolvedName
 	targetPath := d.childPath(parentID, targetName)
 
-	c, err := d.ensureUploadClient()
-	if err != nil {
-		return nil, err
-	}
-
-	// overwrite 模式下 gowebdav WriteStream 直接覆盖；其余模式已由 prepareUploadTarget 解析出唯一名。
+	// 其余冲突策略已由 prepareUploadTarget 解析出唯一文件名；overwrite 直接覆盖。
 	src, err := os.Open(localPath)
 	if err != nil {
 		return nil, domain.Wrap(domain.CodeDriverError, err)
@@ -63,8 +61,8 @@ func (d *Driver) UploadLocalFile(ctx context.Context, req driver.LocalUploadRequ
 			uploadutil.NotifyProgress(req.OnProgress, uploaded, fileSize, "正在上传到 WebDAV")
 		},
 	}
-	if err := c.WriteStream(targetPath, reader, 0o644); err != nil {
-		return nil, mapError(err)
+	if err := d.putStream(ctx, targetPath, reader, fileSize); err != nil {
+		return nil, err
 	}
 	uploadutil.NotifyProgress(req.OnProgress, fileSize, fileSize, "上传成功")
 	return &driver.LocalUploadResult{
@@ -113,4 +111,51 @@ func (d *Driver) prepareUploadTarget(ctx context.Context, parentID, name, policy
 	default:
 		return name, false, nil
 	}
+}
+
+// putStream 发一条带 Content-Length 的 PUT 上传。
+//
+// 刻意不走 gowebdav 的 WriteStream：
+//  1. 它对非 io.Seeker 的流会把整个文件先读进内存（1MB 起步、按需扩容，
+//     通过 FUSE 写 5GB 就是 5GB 内存），大文件直接 OOM；
+//  2. 失败时只返回状态码，服务端的响应正文被丢掉，现场排查只能看到
+//     "WriteStream /path: 409" 这种毫无信息量的报错。
+//
+// 这里直接复用驱动已有的上传专用 HTTP 客户端（流式、可关 HTTP/2），
+// 并把非 2xx 的响应正文截断后带进错误里。
+func (d *Driver) putStream(ctx context.Context, targetPath string, body io.Reader, size int64) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, d.resourceURL(targetPath), body)
+	if err != nil {
+		return domain.Wrap(domain.CodeDriverError, err)
+	}
+	if size >= 0 {
+		req.ContentLength = size
+	}
+	req.Header.Set("User-Agent", httpx.DefaultUserAgent)
+	req.Header.Set("Content-Type", "application/octet-stream")
+	if strings.TrimSpace(d.add.Username) != "" || strings.TrimSpace(d.add.Password) != "" {
+		req.SetBasicAuth(d.add.Username, d.add.Password)
+	}
+	client := d.uploadHTTP
+	if client == nil {
+		client = &http.Client{}
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return domain.Wrap(domain.CodeDriverError, err)
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusCreated, http.StatusNoContent:
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return nil
+	}
+	detail := ""
+	if raw, readErr := io.ReadAll(io.LimitReader(resp.Body, 512)); readErr == nil {
+		detail = strings.TrimSpace(string(raw))
+	}
+	if detail == "" {
+		return domain.Errorf(domain.CodeDriverError, "PUT %s 失败: %s", targetPath, resp.Status)
+	}
+	return domain.Errorf(domain.CodeDriverError, "PUT %s 失败: %s: %s", targetPath, resp.Status, detail)
 }
