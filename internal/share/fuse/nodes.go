@@ -339,12 +339,11 @@ func (d *cloudDir) renameFinishedStaging(ctx context.Context, targetDir *cloudDi
 		// 云端还看不到（极短窗口内的最终一致性），交给上传任务后续处理，不当成失败。
 		return 0
 	}
-	if targetDir.item.ID != d.item.ID {
-		if err := d.b.deps.Files.MoveFiles(ctx, d.b.accountID(), []string{src.ID}, targetDir.item.ID, d.item.ID); err != nil {
-			return errnoFor(err)
-		}
-	}
-	if err := d.b.deps.Files.RenameFile(ctx, d.b.accountID(), src.ID, newName, targetDir.item.ID); err != nil {
+	// 统一交给 file.Service：内部会用「移动后的新 ID」去改名、做最终校验并回滚。
+	// 这里不能自己拼 MoveFiles + RenameFile：IDPath 驱动（路径即 ID）移动后旧 ID 立即失效，
+	// 拿旧 ID 去改名必然 404 source file not found，而移动其实已经生效，
+	// 结果是“文件到目标了、调用方却收到 ENOENT”，外部工具（mdc / mv）会一直重试到失败。
+	if _, err := d.b.deps.Files.MoveAndRename(ctx, d.b.accountID(), src.ID, oldName, d.item.ID, targetDir.item.ID, newName); err != nil {
 		return errnoFor(err)
 	}
 	return 0
