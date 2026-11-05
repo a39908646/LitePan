@@ -43,6 +43,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0          # git describe 需要 tag 历史
+          fetch-tags: true        # 默认只拉分支不拉 tag，不开这个 git describe 拿不到版本
 
       # ── 版本号：镜像 tag = UI 显示版本 ─────────────────────────────────────
       - name: 计算版本号并注入源码
@@ -65,9 +66,9 @@ jobs:
           grep -qF "APP_VERSION = \"${VER}\";" web/src/version.ts \
             || { echo "::error::web/src/version.ts 版本注入失败（上游可能改了这个文件的结构）"; exit 1; }
 
-          # 后端：/api 返回的版本（注意 Go 行尾无分号，且不要用 $ 锚点，避免被 CRLF 的 \r 卡住）
+          # 后端：/api 返回的版本（Go 行尾无分号，且不要用 $ 锚点，避免被 CRLF 的 \r 卡住）
           sed -i -E "s|^var Version = \".*\"|var Version = \"${VER}\"|" internal/buildinfo/version.go
-          grep -qF "Version = \"${VER}\";" internal/buildinfo/version.go \
+          grep -qF "Version = \"${VER}\"" internal/buildinfo/version.go \
             || { echo "::error::internal/buildinfo/version.go 版本注入失败（上游可能改了这个文件的结构）"; exit 1; }
 
           # 断言没被改坏：镜像名必须全小写
