@@ -22,6 +22,9 @@ type cloudDir struct {
 	fs.Inode
 	b    *backend
 	item domain.FileItem
+	// freshAt 非零表示本会话内刚创建/刚改名：短时间内跳过一致性校验，
+	// 避免网盘列表的最终一致性把刚建好的节点误判成幽灵。
+	freshAt time.Time
 }
 
 var (
@@ -91,9 +94,15 @@ func (d *cloudDir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) 
 			out.Attr = a.Attr
 			return ch, 0
 		case *cloudDir:
+			if errno := d.healStaleChild(ctx, name, n.freshAt); errno != 0 {
+				return nil, errno
+			}
 			fillEntryAttr(out, d.b, n.item)
 			return ch, 0
 		case *cloudFile:
+			if errno := d.healStaleChild(ctx, name, n.freshAt); errno != 0 {
+				return nil, errno
+			}
 			fillEntryAttr(out, d.b, n.item)
 			return ch, 0
 		}
@@ -129,6 +138,8 @@ func (d *cloudDir) Mkdir(ctx context.Context, name string, _ uint32, out *fuse.E
 	if errno != 0 {
 		return nil, errno
 	}
+	// 同名残留节点先丢掉：旧版本留下的幽灵会让后续 rename / lookup 一路 ENOENT。
+	d.RmChild(name)
 	item, err := d.b.deps.Files.CreateFolder(ctx, d.b.accountID(), d.item.ID, name)
 	if err != nil {
 		return nil, errnoFor(err)
@@ -140,6 +151,7 @@ func (d *cloudDir) Mkdir(ctx context.Context, name string, _ uint32, out *fuse.E
 	if child == nil {
 		return nil, syscall.EIO
 	}
+	markFresh(child)
 	fillEntryAttr(out, d.b, *item)
 	return child, 0
 }
@@ -227,16 +239,22 @@ func (d *cloudDir) Rename(ctx context.Context, name string, newParent fs.InodeEm
 		case *stagingFile:
 			return d.renameStaging(ctx, n, targetDir, newName)
 		case *cloudDir:
-			return d.renameNode(ctx, &n.item, targetDir, newName)
+			if errno := d.renameNode(ctx, name, &n.item, &n.freshAt, targetDir, newName); errno != 0 {
+				return errno
+			}
+			return 0
 		case *cloudFile:
-			return d.renameNode(ctx, &n.item, targetDir, newName)
+			if errno := d.renameNode(ctx, name, &n.item, &n.freshAt, targetDir, newName); errno != 0 {
+				return errno
+			}
+			return 0
 		}
 	}
 	item, errno := d.lookupChildItem(ctx, name)
 	if errno != 0 {
 		return errno
 	}
-	return d.renameNode(ctx, &item, targetDir, newName)
+	return d.renameNode(ctx, name, &item, nil, targetDir, newName)
 }
 
 // renameNode 执行重命名，并把客户端的节点状态对齐到服务端结果。
@@ -244,15 +262,23 @@ func (d *cloudDir) Rename(ctx context.Context, name string, newParent fs.InodeEm
 // 更新 item 是必须的：IDPath 驱动（如 WebDAV / OpenList）的 fileID 就是路径，
 // 移动或改名之后旧 ID 立即失效；不更新就会让后续 stat/open 拿着不存在的旧路径
 // 去请求，表现为幽灵条目 / EEXIST / ENOENT。“成功”必须意味着本地状态与云端一致。
-func (d *cloudDir) renameNode(ctx context.Context, item *domain.FileItem, targetDir *cloudDir, newName string) syscall.Errno {
+//
+// 失败时清掉两侧同名子节点：失败意味着我们已经无法保证内存节点与云端一致，
+// 留着它就会变成幽灵（内核据此报 EEXIST，且不再把请求交给我们）。
+func (d *cloudDir) renameNode(ctx context.Context, name string, item *domain.FileItem, freshAt *time.Time, targetDir *cloudDir, newName string) syscall.Errno {
 	newID, errno := d.renameRemote(ctx, *item, targetDir, newName)
 	if errno != 0 {
+		d.RmChild(name)
+		targetDir.RmChild(newName)
 		return errno
 	}
 	if newID != "" {
 		item.ID = newID
 	}
 	item.Name = newName
+	if freshAt != nil {
+		*freshAt = time.Now()
+	}
 	return 0
 }
 
@@ -382,6 +408,46 @@ func (d *cloudDir) lookupChildItemIfExists(ctx context.Context, name string) (do
 	return domain.FileItem{}, false, 0
 }
 
+// staleGrace 是本会话新建节点的保护窗口：网盘目录列表存在最终一致性，
+// 刚建好的条目可能短暂不在列表里，这段时间内不做过期判定。
+const staleGrace = 5 * time.Second
+
+// healStaleChild 校验内存子节点是否仍然对应网盘上的真实条目，并清理幽灵节点。
+//
+// 背景：旧版本 rename 失败时也返回成功，go-fuse 据此把 inode 挂到新名字上，
+// 而网盘上并没有那个条目 —— 形成幽灵节点。幽灵会让内核认为该名字已存在：
+// mkdir 直接 EEXIST、rename 进入后下一层 ENOENT，且请求根本到不了本进程的
+// 各个处理函数（日志里什么都看不到）。所以只能在 Lookup 阶段自愈：网盘上查不到
+// 就丢弃节点并返回 ENOENT，让内核跟着丢掉对应的 dentry。
+func (d *cloudDir) healStaleChild(ctx context.Context, name string, freshAt time.Time) syscall.Errno {
+	if !freshAt.IsZero() && time.Since(freshAt) < staleGrace {
+		return 0
+	}
+	_, found, errno := d.lookupChildItemIfExists(ctx, name)
+	// 列表本身失败（驱动抖动/网络）不能当作条目不存在，否则会误删健康节点。
+	if errno != 0 || found {
+		return 0
+	}
+	d.RmChild(name)
+	if d.b.deps.Log != nil {
+		d.b.deps.Log.Warn("FUSE 清理幽灵节点", "name", name, "parent_id", d.item.ID)
+	}
+	return syscall.ENOENT
+}
+
+// markFresh 给本次会话新建/刚改名的节点打上保护窗口。
+func markFresh(inode *fs.Inode) {
+	if inode == nil {
+		return
+	}
+	switch n := inode.Operations().(type) {
+	case *cloudDir:
+		n.freshAt = time.Now()
+	case *cloudFile:
+		n.freshAt = time.Now()
+	}
+}
+
 func normalizeChildName(name string) (string, syscall.Errno) {
 	name = strings.TrimSpace(name)
 	if name == "" || name == "." || name == ".." || strings.Contains(name, "/") {
@@ -394,6 +460,8 @@ type cloudFile struct {
 	fs.Inode
 	b    *backend
 	item domain.FileItem
+	// freshAt 含义同 cloudDir.freshAt。
+	freshAt time.Time
 }
 
 var (
