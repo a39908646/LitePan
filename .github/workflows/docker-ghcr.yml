@@ -55,7 +55,12 @@ jobs:
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             VER="${GITHUB_REF_NAME}"
           else
-            BASE="$(git describe --tags --abbrev=0 2>/dev/null || echo v0.0.0)"
+            # 基准版本优先取 web/src/version.ts 里上游维护的 APP_VERSION：
+            # 它总是反映“你当前同步到哪个上游版本”，不依赖 fork 里有没有打 tag。
+            # （fork 默认不会带上游 tag，git describe 会直接失败退化成 v0.0.0）
+            BASE="$(grep -oE 'APP_VERSION = "[^"]+"' web/src/version.ts \
+                    | head -1 | sed -E 's/.*"(.*)"/\1/')"
+            [ -n "$BASE" ] || BASE="$(git describe --tags --abbrev=0 2>/dev/null || echo v0.0.0)"
             VER="${BASE}-fork.${SHA}"
           fi
           echo "version=${VER}" >> "$GITHUB_OUTPUT"
