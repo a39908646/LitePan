@@ -3,8 +3,8 @@ name: docker-ghcr
 # 构建二开镜像并推到 GHCR，供 fnOS / NAS 直接 pull。
 #
 # 触发：
-#   · 推 tag（如 v0.5.7-beta-fork.1）→ 推 latest + 该 tag 名 + sha-xxxxxxx
-#   · 手动 workflow_dispatch        → 推 edge + sha-xxxxxxx
+#   · 推 tag（命名规则 v<上游版本>.<序号>，如 v0.5.7-beta.1）→ 推 latest + 该 tag 名 + sha-xxxxxxx
+#   · 手动 workflow_dispatch        → 推 edge + sha-xxxxxxx（版本号带 -dev. 标记）
 #
 # 构建前会把版本号写进源码（只在 runner 的工作区里改，不提交）：
 #   · web/src/version.ts            → 前端 UI 显示的版本
@@ -61,7 +61,7 @@ jobs:
             BASE="$(grep -oE 'APP_VERSION = "[^"]+"' web/src/version.ts \
                     | head -1 | sed -E 's/.*"(.*)"/\1/')"
             [ -n "$BASE" ] || BASE="$(git describe --tags --abbrev=0 2>/dev/null || echo v0.0.0)"
-            VER="${BASE}-fork.${SHA}"
+            VER="${BASE}-dev.${SHA}"
           fi
           echo "version=${VER}" >> "$GITHUB_OUTPUT"
           echo "版本号：${VER}"

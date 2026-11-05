@@ -225,7 +225,7 @@ docker compose -f docker-compose.fnos.yml -f docker-compose.ghcr.yml pull
 docker compose -f docker-compose.fnos.yml -f docker-compose.ghcr.yml up -d
 ```
 
-回滚：把 `image:` 换成上一次的 `vX.Y.Z-fork.<n>` 或 `sha-xxxxxxx`（Actions 页面能看到全部 tag）。
+回滚：把 `image:` 换成上一次的 `v0.5.7-beta.<n>` 或 `sha-xxxxxxx`（Actions 页面能看到全部 tag）。
 
 ### 三个必踩的坑
 

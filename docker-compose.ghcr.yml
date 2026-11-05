@@ -11,7 +11,7 @@
 # 用法（标准端口映射）：
 #   docker compose -f docker-compose.yml -f docker-compose.ghcr.yml up -d
 #
-# 回滚：把 tag 换成上一次的 vX.Y.Z-fork.<n> 或 sha-xxxxxxx（Actions 里能看到全部 tag）
+# 回滚：把 tag 换成上一次的 v0.5.7-beta.<n> 或 sha-xxxxxxx（Actions 里能看到全部 tag）
 #
 # 包默认 private，NAS 首次 pull 若报 401：见 docs/upstream-sync.md §9
 services:
