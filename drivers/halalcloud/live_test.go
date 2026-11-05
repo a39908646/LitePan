@@ -112,7 +112,7 @@ func TestLiveSmoke(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UploadLocalFile（多分块 12MB）失败: %v", err)
 	}
-	t.Logf("多分块上传成功: id=%q size=%d 耗时 %v", res.FileID, res.Size, firstCost.Round(time.Millisecond))
+	t.Logf("多分块上传: id=%q size=%d 耗时 %v msg=%q", res.FileID, res.Size, firstCost.Round(time.Millisecond), res.Message)
 
 	// ② 回读确认大小
 	list, err := d.ListFiles(ctx, created.ID)
@@ -186,7 +186,34 @@ func TestLiveSmoke(t *testing.T) {
 		t.Errorf("第二次上传失败: %v", err)
 	} else {
 		second := time.Since(start)
-		t.Logf("第二次上传（同内容 12MB）耗时 %v，首次 %v", second.Round(time.Millisecond), firstCost.Round(time.Millisecond))
+		t.Logf("第二次上传耗时 %v，首次 %v", second.Round(time.Millisecond), firstCost.Round(time.Millisecond))
+	}
+
+	// ⑥b 打印目录里每个文件的真实大小与上传返回文案
+	final, err := d.ListFiles(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("最终回读失败: %v", err)
+	}
+	for _, it := range final {
+		t.Logf("  文件: %-16s size=%d", it.Name, it.Size)
+	}
+
+	// ⑥c 同名覆盖重传：模拟调用方重试（FUSE 侧发生过的场景）
+	dup1, err := d.UploadLocalFile(ctx, localUpload(big, "dup.bin", created.ID))
+	if err != nil {
+		t.Fatalf("同名上传(第1次)失败: %v", err)
+	}
+	t.Logf("同名上传第1次: msg=%q size=%d", dup1.Message, dup1.Size)
+	if got, ok := d.cloudSize(ctx, created.ID, "dup.bin"); !ok || got != int64(len(payload)) {
+		t.Errorf("同名上传第1次后大小异常: got=%d ok=%v", got, ok)
+	}
+	dup2, err := d.UploadLocalFile(ctx, localUpload(big, "dup.bin", created.ID))
+	if err != nil {
+		t.Fatalf("同名上传(第2次)失败: %v", err)
+	}
+	t.Logf("同名上传第2次: msg=%q", dup2.Message)
+	if got, ok := d.cloudSize(ctx, created.ID, "dup.bin"); !ok || got != int64(len(payload)) {
+		t.Errorf("★★ 同名重传后文件被破坏: got=%d ok=%v（期望 %d）", got, ok, len(payload))
 	}
 
 	// ⑦ 删除单个文件（进回收站）
