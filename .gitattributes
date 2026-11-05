@@ -1,0 +1,18 @@
+# ── 前端构建产物（internal/api/web/）──────────────────────────────────────────
+#
+# 该目录是 web/vite.config.ts 的 outDir（outDir: "../internal/api/web"，
+# emptyOutDir: true），由 `npm run build` 全量重写，经 //go:embed web 编进二进制。
+# 内容 = web/public/ 的拷贝 + 164 个带内容 hash 的资源 + 160 个 .gz 预压缩文件。
+#
+# 上游发版时 Dockerfile 会 `COPY --from=web /src/internal/api/web` 重新构建，
+# 即上游自己也无视仓库里这份产物 —— 它们纯粹是仓库噪声，内容无版本意义。
+#
+# 约定：与 upstream 合并时，这些文件的冲突一律取本地一侧，构建时重新生成即可。
+#       merge=ours 需本地 driver，每个 clone 跑一次：make setup
+internal/api/web/**  merge=ours -diff
+
+# ── 行尾规范化 ───────────────────────────────────────────────────────────────
+# 本机 core.autocrlf=true：不声明的话 .sh / Makefile 在 checkout 时会被改成 CRLF，
+# 导致 Linux / CI / 容器里的 bash 与 make 拿到的命令行带 \r。
+*.sh      text eol=lf
+Makefile  text eol=lf
