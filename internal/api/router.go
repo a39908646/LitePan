@@ -224,6 +224,13 @@ func NewRouter(d Deps) http.Handler {
 		})
 		r.Route("/open", func(r chi.Router) {
 			r.Post("/automation/events", h.automationWebhook)
+			// 供外部脚本（油猴）调用：只认 task 类型 API Key，账号取自 Key 备注。
+			r.Route("/offline-download", func(r chi.Router) {
+				r.Get("/capabilities", h.scriptOfflineCapabilities)
+				r.Post("/urls", h.scriptOfflineAddURLs)
+				r.Get("/tasks", h.scriptOfflineListTasks)
+				r.Post("/tasks/batch-delete", h.scriptOfflineBatchDeleteTasks)
+			})
 		})
 		r.Group(func(r chi.Router) {
 			r.Use(h.requireAdmin)
