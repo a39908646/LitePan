@@ -1,7 +1,7 @@
 # 上游同步手册
 
-本仓库是 [Ponphil/LitePan](https://github.com/Ponphil/LitePan) 的 fork，用于二次开发
-（功能增强 + bug 修复）。**不向上游贡献代码，不对上游产生任何影响**。
+LitePan 的独立演进版（源自 [Ponphil/LitePan](https://github.com/Ponphil/LitePan)）：功能增强 +
+bug 修复，向上游取用而不向上游回馈。
 
 > 许可证为 **PolyForm Noncommercial 1.0.0**：仅限非商业用途。
 > 涉及售卖 / 闭源商业分发前，必须先取得上游授权。
@@ -17,9 +17,9 @@ origin/main     ← 自己的 GitHub 备份
 ```
 
 **不需要"跟随上游"的分支**：上游状态由 `upstream/main` 这个远端引用表示，随时可 diff / merge。
-冲突量与分支数量无关，只取决于同步频率和改动落点。
+冲突量与分支数量无关，只取决于同步频率和改动量。
 
-发版从 `main` 打 tag，命名建议 `<上游版本>-<序号>`，如 `v0.5.7-Beta-1`。
+发版从 `main` 打 tag，命名 `v<上游版本>.<序号>`，如 `v0.5.7-beta.1`（CI 靠这个推镜像 tag）。
 
 ---
 
@@ -47,30 +47,30 @@ git push origin main --tags                     # ⑥ 备份
 
 **回退**：未 push 用 `git reset --hard pre-sync-xxx`；已 push 用 `git revert -m 1 <merge-sha>`。
 
-### ⚠️ 硬禁忌
+### 一点提示
 
-**永远不要点 GitHub 网页上的 "Sync fork" 按钮。** 单分支方案下你的 main 有二开提交，
-快进合并不成立，按钮里会建议 **"Discard commits"** —— 误点等于丢掉本地未 push 的提交。
-同步只在本地做。
+GitHub 网页的 "Sync fork" 按钮在单分支下会建议 "Discard commits"，误点等于丢掉未 push 的
+本地提交。用不用它随你，但别在没 push 的时候点。
 
-辅助措施（已配置，可重复执行）：
+`upstream` 的 push 地址已设为 `DISABLED`，物理上推不上去：
 
 ```bash
-git remote set-url --push upstream DISABLED   # upstream 物理上无法 push
+git remote set-url --push upstream DISABLED
 ```
 
 ---
 
-## 3. 冲突处理规则
+## 3. 冲突处理
 
-**最高原则：冲突时永远是"上游是最新基线，我的补丁重贴上去"，而不是"我的版本为主，
-把上游塞进来"。** 反过来做，第一次省事，第三次同步就崩。
+没有预设原则。**当成两个独立产品合并来看：哪个版本的行为更对，就留哪个。**
+大多是逐个 hunk 看，而不是整套选边。
 
-| 类型 | 典型文件 | 处理 |
+| 类型 | 典型文件 | 常见做法 |
 |---|---|---|
 | **生成物** | `internal/api/web/**` | 不看内容。取任意一侧后重新 `npm run build` |
-| **上游重构了结构** | 上游拆/并包、改签名 | 以上游为新基线，把自己的改动重贴到新结构上 |
-| **同文件不同行** | `internal/api/router.go` 双加路由 | 两边都留（这就是要求"只在块尾追加"的原因） |
+| **上游重构了结构** | 上游拆/并包、改签名 | 想跟就重贴，懒得跟就把自己的删了重写 |
+| **同文件不同行** | `internal/api/router.go` | 两边都留 |
+| **同文件同一块** | `CrossDriveTransfer.vue` 这类上游热文件 | 按功能取舍，不保证保留上游写法 |
 
 生成物冲突的具体操作：
 
@@ -82,41 +82,17 @@ git add -A && git commit --no-edit
 
 ---
 
-## 4. 落点纪律（长期成本的核心）
+## 4. 改动落点：不设约束
 
-**原则：自己的代码放进自己能完全拥有的新文件；上游文件只允许"块尾追加几行"。**
+**这个 fork 是独立产品，不是上游的补丁队列。** 上游保留为「参考上游」，只为偶尔取用它的
+新功能或修 bug，不承诺与本 fork 长期保持可合并。
 
-### 上游冲突热点（近 200 次提交改动次数）
+所以没有落点纪律：新功能该塞进现有包就塞，该重构上游文件就重构，该删上游文件就删，
+`go.mod` 的 `module` 想改就改，想跑 `gofmt` / prettier 就跑。合并上游时冲突多，那是合并
+那一刻要付的成本，不是写代码时要预支的枷锁。
 
-| 文件 | 次数 | 说明 |
-|---|---|---|
-| `internal/api/web/index.html` | 110 | 前端产物（已用 `merge=ours` 处理） |
-| `internal/api/router.go` | 35 | 672 行，单文件集中注册所有路由 |
-| `internal/settings/registry.go` | 25 | `defaultSpecs()` 返回设置项字面量 |
-| `web/src/components/admin/*Panel.vue` | ~21 | 上游高频重构的界面组件 |
-| `internal/app/wire_services.go` | 19 | 依赖注入装配 |
-| `web/src/version.ts` | 16 | 品牌与版本号唯一来源 |
-| `internal/app/wire_http.go` | 16 | HTTP 依赖装配 |
-
-### 落点约定
-
-| 要加的东西 | ❌ 不要 | ✅ 应该 |
-|---|---|---|
-| 新后端功能 | 塞进现有 `internal/` 包 | 新包 `internal/<feature>/`，接入点只加一行 |
-| 新 API 路由 | 往 `router.go` 中间插入 | 在 `r.Route("/api", ...)` **块尾**追加 `r.Route("/x-foo", registerFoo)`；handler 放自己的文件 |
-| 新设置项 | 改 `registry.go` 的 `defaultSpecs()` | 自己的文件里定义 `extraSpecs`；在冷文件 `internal/settings/service.go:33` 改一行 `specs := append(defaultSpecs(), extraSpecs()...)` |
-| 新驱动 | 改驱动抽象层 | `drivers/all.go` 加一行 import（上游已是此模式） |
-| 改前端页面 | 直接改 `components/admin/*Panel.vue` | 新页面放 `web/src/views/your-*.vue`；复用上游组件用 wrapper / 插槽，不改原件 |
-| 前端路由 | 中间插入 | `web/src/router` 路由表**尾部**追加 |
-| 品牌 / 版本号 | 分散改多处 | 只改 `web/src/version.ts` + `internal/buildinfo`，单独一个 commit；或用 `-ldflags "-X litepan/internal/buildinfo.Version=..."` 覆盖，文件不动 |
-
-### 三条硬约束
-
-1. **不要改 `go.mod` 的 `module litepan`**。改成 `github.com/xxx/litepan` 会让全仓 import
-   路径变化，上游每一次改动都变成全仓冲突。这是 fork 最贵的错误。
-2. **不要重新格式化上游文件**。别顺手对全仓跑 `gofmt` / prettier，空白改动会让后续每次
-   merge 都撞车。
-3. **不要删上游文件**。下游删除 + 上游修改 = 永久 `modify/delete` 冲突。用不上就留着。
+实践上的唯一建议（不是规则，是省钱）：能放新文件就放新文件。这样将来真要 merge，冲突面的
+大小由「你自己产品的结构」决定，而不是由上游的结构决定。
 
 ### 提交信息约定
 
@@ -187,18 +163,14 @@ make build-nofuse
 
 ---
 
-## 8. 明确不做
+## 8. 已知不划算的做法
 
 | 不做 | 原因 |
 |---|---|
-| 给上游开 PR / issue | 要求零影响，不贡献代码 |
-| 用 GitHub "Sync fork" 按钮 | 单分支下是 Discard 陷阱 |
-| rebase 二开历史 | 每次上游更新要重放全部提交，越往后越痛 |
 | 把上游当 Go module 依赖 | 单体应用 + `//go:embed`，拆不动 |
-| patch 队列（quilt / stgit） | 改动量不足以抵消工具成本 |
-| 改 module path | 见 §4 硬约束 1 |
+| patch 队列（quilt / stgit） | 维护成本远高于收益 |
 
----
+其余（PR 上游、rebase、改 module path、用不用网页 Sync fork）都不做规定，按当次需要决定。
 
 ## 9. Docker 镜像（GHCR）
 
@@ -212,7 +184,8 @@ make build-nofuse
 | 架构 | `linux/amd64`（要 arm64 改 workflow 里 `platforms` 一行，并给 web 阶段加 `--platform=$BUILDPLATFORM`） |
 | 版本注入 | 构建前把版本号 sed 进 `web/src/version.ts`（UI 显示）和 `internal/buildinfo/version.go`（`/api` 返回），只在 runner 工作区改，不提交；sed 后断言校验，上游改了文件结构会直接失败 |
 
-**为什么不改 Dockerfile 加 ldflags**：`Dockerfile` 是上游文件，改了每次同步都要处理冲突（§4 落点纪律）。
+**为什么不改 Dockerfile 加 ldflags**：`Dockerfile` 是上游改动频繁的文件，改它只会让合并更痛；
+sed + 断言在 CI 里做同样的事，不动它。
 sed + 断言在 CI 里完成同样的事，仓库里的上游文件保持原样。
 
 ### NAS 上使用

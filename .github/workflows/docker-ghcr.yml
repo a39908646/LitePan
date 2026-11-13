@@ -10,8 +10,8 @@ name: docker-ghcr
 #   · web/src/version.ts            → 前端 UI 显示的版本
 #   · internal/buildinfo/version.go → 后端 /api 返回的版本
 #   这样镜像里显示的版本 = 镜像 tag，不会出现"跑的是哪个镜像"分不清的情况。
-#   不这么做的替代方案是改 Dockerfile 加 ldflags / build-arg，但那要动上游文件，
-#   会让上游同步变贵（见 docs/upstream-sync.md §4）；这里选 sed 源码 + 断言校验。
+#   不这么做的替代方案是改 Dockerfile 加 ldflags / build-arg；这里选 sed 源码 + 断言校验，
+#   因为 Dockerfile 是上游改动频繁的文件，改它没好处。
 #
 # 首次使用前：仓库 Actions 页面点一次 enable（fork 默认不放行工作流）。
 # 推上去后包默认 private：GitHub → Packages → 该包 → Settings → Change visibility → Public，

@@ -1,8 +1,8 @@
 # GHCR 镜像覆盖层
 #
 # 只覆盖 image 一项，其余（volumes / devices / privileged / pid / network_mode）
-# 全部沿用基础 compose 文件 —— 因此上游的 docker-compose.yml 与
-# docker-compose.fnos.yml 一行都不用改（见 docs/upstream-sync.md §4 落点纪律）。
+# 全部沿用基础 compose 文件 —— 因此 docker-compose.yml 与
+# docker-compose.fnos.yml 一行都不用改。
 #
 # 用法（fnOS / NAS，用你自己的路径那套）：
 #   docker compose -f docker-compose.fnos.yml -f docker-compose.ghcr.yml pull

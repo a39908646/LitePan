@@ -2,10 +2,10 @@
 #
 # sync-upstream.sh —— 安全地把上游 Ponphil/LitePan 的更新合并进当前分支。
 #
-# 设计原则（对应 docs/upstream-sync.md）：
+# 设计原则：
 #   1. 只读优先：默认先 fetch + 报告规模，不自动合并
 #   2. 破坏性动作前留退路：合并前必打 pre-sync-<日期> tag
-#   3. 不越权：不 push、不改上游、不碰 GitHub 网页的 Sync fork 按钮
+#   3. 不 push、不改上游远程
 #   4. 生成物单独处理：internal/api/web/ 的本地脏改动可直接丢弃（构建会重生成）
 #
 # 用法：
@@ -100,7 +100,7 @@ git log --oneline --no-decorate "HEAD..$UPSTREAM/main" | sed 's/^/    /'
 say "上游改动的文件规模："
 git diff --stat "HEAD...$UPSTREAM/main" | tail -n 20 | sed 's/^/    /'
 
-# 你的二开落点（提醒：这些文件上游也改过 → 冲突概率高）
+# 双方都改动过的文件（合并时最可能撞车，仅供心理预期）
 # 两侧都用三点 diff（相对共同祖先），否则会把上游改动反向算进本分支。
 OVERLAP="$(comm -12 \
   <(git diff --name-only "HEAD...$UPSTREAM/main" | sort -u) \
