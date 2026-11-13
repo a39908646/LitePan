@@ -186,19 +186,49 @@ make build-nofuse
 
 **为什么不改 Dockerfile 加 ldflags**：`Dockerfile` 是上游改动频繁的文件，改它只会让合并更痛；
 sed + 断言在 CI 里做同样的事，不动它。
-sed + 断言在 CI 里完成同样的事，仓库里的上游文件保持原样。
 
-### NAS 上使用
+### fnOS / NAS
 
-`docker-compose.ghcr.yml` 是一个 **只覆盖 `image` 的覆盖层**，基础配置（`volumes` / `devices` /
-`privileged` / `pid: host` / `network_mode`）仍用上游那两个 compose 文件，一行都不用改：
+**fnOS 的 compose 只认项目目录下那一个 `docker-compose.yml`，不支持 `-f` 叠加文件。**
+所以 `docker-compose.ghcr.yml` 在 fnOS 上**用不了**，把 `image:` 直接写进那一个文件：
 
-```bash
-docker compose -f docker-compose.fnos.yml -f docker-compose.ghcr.yml pull
-docker compose -f docker-compose.fnos.yml -f docker-compose.ghcr.yml up -d
+```yaml
+services:
+  litepan:
+    image: ghcr.io/a39908646/litepan:latest
+    ...
 ```
 
-回滚：把 `image:` 换成上一次的 `v0.5.7-beta.<n>` 或 `sha-xxxxxxx`（Actions 页面能看到全部 tag）。
+升级（以实际部署目录为准）：
+
+```bash
+cd /vol1/1000/Docker/litepan
+docker compose -p "$(docker inspect litepan \
+  --format '{{index .Config.Labels "com.docker.compose.project"}}')" pull
+docker compose -p "$(docker inspect litepan \
+  --format '{{index .Config.Labels "com.docker.compose.project"}}')" up -d
+
+docker image inspect ghcr.io/a39908646/litepan:latest \
+  --format '{{index .Config.Labels "org.opencontainers.image.version"}}'
+```
+
+`-p` 必须取已有容器标签里的 project 名：目录名推出来的项目名可能和当初创建时不一致（比如
+目录 `litepan`、项目 `liepan`），不一致就报 `container name "/litepan" is already in use`。
+
+回滚：`image:` 换成上一次的 `v0.5.7-beta.<n>` 或 `sha-xxxxxxx`（Actions 页面能看到全部 tag），
+或本地先把旧镜像 `docker tag <旧镜像ID> ghcr.io/a39908646/litepan:rollback` 存下再换。
+
+### 支持 `-f` 叠加的环境（普通 Linux / 群晖 CLI 等）
+
+`docker-compose.ghcr.yml` 是一个**只覆盖 `image` 的覆盖层**，基础配置（`volumes` / `devices` /
+`privileged` / `pid: host` / `network_mode`）继续用基础 compose 文件：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.ghcr.yml up -d
+```
+
+fnOS 不要用这个写法。
+
 
 ### 三个必踩的坑
 
