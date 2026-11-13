@@ -44,12 +44,28 @@
             <span class="c-caret"><SvgIcon name="chevron-down" size="1em" /></span>
           </button>
         </div>
+        <div v-if="srcTree && srcTree.length" class="tree-select-bar">
+          <span class="tsb-count">已选 <b>{{ selectedFileCount }}</b> / {{ metrics.total }} 个文件</span>
+          <span class="tsb-actions">
+            <button type="button" class="tsb-btn" :disabled="selectedFileCount === metrics.total" @click="selectAllNodes">全选</button>
+            <button type="button" class="tsb-btn" :disabled="selectedFileCount === 0" @click="selectNoNodes">全不选</button>
+          </span>
+        </div>
         <div class="tree tree-host" ref="srcTreeRef">
           <div v-if="scanSummary && !phaseStatus" class="tree-scan-banner" :class="{ warn: scanSummary.warn }">
             <SvgIcon :name="scanSummary.warn ? 'triangle-exclamation' : 'circle-check'" size="1em" />
             <span>{{ scanSummary.text }}</span>
           </div>
-          <CrossTransferTree v-if="srcTree && srcTree.length" :nodes="srcTree" mode="src" :depth="0" />
+          <CrossTransferTree
+            v-if="srcTree && srcTree.length"
+            :nodes="srcTree"
+            mode="src"
+            :depth="0"
+            selectable
+            :is-checked="isNodeChecked"
+            :is-indeterminate="isNodeIndeterminate"
+            :on-toggle="toggleNodeCheck"
+          />
           <div v-else-if="!phaseStatus" class="tree-empty">选择源目录后，扫描/试探会在此显示文件与秒传状态</div>
           <div v-if="phaseStatus && (!srcTree || !srcTree.length)" class="tree-phase-fill">
             <div class="tree-phase-card">
@@ -69,6 +85,10 @@
             <span class="c-text" :class="{ placeholder: !dst }">{{ dst ? (dst.accName + ' · ' + dst.path) : '选择账号 · 目录' }}</span>
             <span class="c-caret"><SvgIcon name="chevron-down" size="1em" /></span>
           </button>
+          <p v-if="dstLanding" class="dst-landing" :class="{ warn: dstLandingMulti }">
+            <SvgIcon name="circle-info" size="1em" />
+            <span>{{ dstLanding }}</span>
+          </p>
         </div>
         <div class="tree">
           <div v-if="!dstTree || !dstTree.length" class="tree-empty">秒传完成后显示已转存文件</div>
@@ -83,6 +103,8 @@
         <div class="ct-footer-left">
           <div class="ft-stats">
             <span class="ft-item"><span class="n">{{ metrics.total }}</span><span class="l">扫描</span></span>
+            <span class="ft-sep" aria-hidden="true"></span>
+            <span class="ft-item"><span class="n">{{ selectedFileCount }}</span><span class="l">已选</span></span>
             <span class="ft-sep" aria-hidden="true"></span>
             <span class="ft-item"><span class="n ok">{{ metrics.ok }}</span><span class="l">可秒传</span></span>
             <span class="ft-sep" aria-hidden="true"></span>
@@ -387,9 +409,143 @@ const srcPickerTitle = computed(() => (
   src.value ? sourceRoots.value.map(item => item.path).join('\n') : ''
 ))
 
+// ── 树上勾选 ───────────────────────────────────────────────
+// 默认全选，只记录「被取消」的 key。路径在重扫后是稳定的，所以试探/传输前
+// 重新扫描不会丢掉选择；换源目录时才重置。
+const deselected = ref(new Set())
+const dirKey = (relDir) => 'd:' + (relDir ?? '')
+const fileKey = (relPath) => 'f:' + (relPath ?? '')
+const nodeKey = (node) => (node.type === 'dir' ? dirKey(node._relDir) : fileKey(node.rel_path))
+const isDeselected = (node) => deselected.value.has(nodeKey(node))
+const isNodeChecked = (node) => !isDeselected(node)
+
+function subtreeKeys(node, out = []) {
+  out.push(nodeKey(node))
+  for (const child of node.children || []) subtreeKeys(child, out)
+  return out
+}
+
+// 同时统计子树里的文件数与已取消数，半选状态与「保留目录结构」判定共用。
+function subtreeStats(node) {
+  if (node.type === 'file') return { total: 1, off: isDeselected(node) ? 1 : 0 }
+  let total = 0
+  let off = 0
+  for (const child of node.children || []) {
+    const s = subtreeStats(child)
+    total += s.total
+    off += s.off
+  }
+  return { total, off }
+}
+
+function isNodeIndeterminate(node) {
+  if (node.type !== 'dir') return false
+  const s = subtreeStats(node)
+  return s.total > 0 && s.off > 0 && s.off < s.total
+}
+
+function toggleNodeCheck(node) {
+  const keys = subtreeKeys(node)
+  const fully = isNodeChecked(node) && !isNodeIndeterminate(node)
+  const next = new Set(deselected.value)
+  if (fully) keys.forEach(k => next.add(k))
+  else keys.forEach(k => next.delete(k))
+  deselected.value = next
+}
+
+function selectAllNodes() {
+  deselected.value = new Set()
+}
+
+function selectNoNodes() {
+  const next = new Set()
+  const walk = (nodes) => {
+    for (const n of nodes || []) {
+      next.add(nodeKey(n))
+      if (n.type === 'dir') walk(n.children)
+    }
+  }
+  walk(srcTree.value)
+  deselected.value = next
+}
+
+const selectedFileCount = computed(() =>
+  (probeFiles.value || []).filter(f => !deselected.value.has(fileKey(f.rel_path))).length,
+)
+
+// 每个目录下「文件总数 / 保留数」，用 rel_dir 作为键。
+function dirFileCounts() {
+  const out = {}
+  const walk = (nodes) => {
+    let total = 0
+    let kept = 0
+    for (const n of nodes || []) {
+      if (n.type === 'dir') {
+        const c = walk(n.children)
+        total += c.total
+        kept += c.kept
+        out[n._relDir] = c
+      } else {
+        total++
+        if (!deselected.value.has(fileKey(n.rel_path))) kept++
+      }
+    }
+    return { total, kept }
+  }
+  const root = walk(srcTree.value)
+  if (!('' in out)) out[''] = root
+  return out
+}
+
+// 交给后端执行的文件集：未全选时重算落点。
+// 目录被整体勾选 → 保留目录结构；只挑了几散文件 → 直接放目标目录。
+function activeFiles() {
+  const all = orderFilesByTree(probeFiles.value)
+  if (!deselected.value.size) return all
+  const kept = all.filter(f => !deselected.value.has(fileKey(f.rel_path)))
+  const counts = dirFileCounts()
+  return kept.map(f => {
+    const s = counts[f.rel_dir]
+    const keepStructure = s ? s.kept === s.total : false
+    // 只改落点目录，保留原 rel_path：它是传输事件与树上节点的唯一标识。
+    return keepStructure ? f : { ...f, rel_dir: '' }
+  })
+}
+
+// effectiveRoots 复刻后端 normalizeScanRoots 的嵌套去重：选中 /a 和 /a/b 时只算 /a。
+// 去重后只剩一个目录时，后端会剥掉目录名，前端文案必须同步，否则会骗人。
+const effectiveRoots = computed(() => {
+  const list = sourceRoots.value
+  if (list.length <= 1) return list
+  return list.filter((root, i) =>
+    !list.some((parent, j) => {
+      if (i === j) return false
+      const pp = (parent.path || '/').replace(/\/+$/, '')
+      const rp = (root.path || '/').replace(/\/+$/, '')
+      return pp === '' || (pp !== rp && rp.startsWith(pp + '/'))
+    }),
+  )
+})
+
+// 目标落点：单选目录时，选区内容直接放进目标目录；多选时各自保留目录名。
+const dstLandingMulti = computed(() => effectiveRoots.value.length > 1)
+const dstLanding = computed(() => {
+  if (!dst.value) return ''
+  const base = (dst.value.path || '/').replace(/\/+$/, '') || '/'
+  const roots = effectiveRoots.value
+  if (!roots.length) return ''
+  if (deselected.value.size > 0) {
+    return `实际落点：${base}（按树上勾选决定：完整勾选的目录保留目录名，散选的文件直接放入）`
+  }
+  if (roots.length === 1) {
+    return `实际落点：${base}（选区内的文件直接放在这里，不再新建同名目录）`
+  }
+  const names = roots.map(item => item.name || '目录').join('、')
+  return `实际落点：${base === '/' ? '' : base}/<${names}>（多选保留各自目录名）`
+})
+
 const accounts = ref([])
 const srcTreeRef = ref(null)
-
 const curRoute = computed(() => routes.value.find(r => r.id === activeId.value) || null)
 const routeBidirectional = computed(() => !!curRoute.value?.bidirectional)
 const srcDriver = computed(() => {
@@ -723,6 +879,7 @@ function onPickerResolve(payload) {
     };
     srcTree.value = null;
     probeFiles.value = [];
+    deselected.value = new Set();
     scanSummary.value = null;
     scanLimitReason.value = '';
   } else {
@@ -818,7 +975,13 @@ async function probe() {
     return
   }
 
-  const orderedProbeFiles = orderFilesByTree(probeFiles.value)
+  const orderedProbeFiles = activeFiles()
+  if (!orderedProbeFiles.length) {
+    notify('warning', '没有勾选任何文件')
+    running.value = ''
+    barWidth.value = 0
+    return
+  }
   const { nodeMap, fileMap, orderedPaths, setNodeRun, clearAllRun, scrollToFile } = createFileRunContext(orderedProbeFiles)
   if (orderedPaths.length) {
     setNodeRun(orderedPaths[0], true)
@@ -933,7 +1096,13 @@ async function start() {
     return
   }
 
-  const files = orderFilesByTree(probeFiles.value)
+  const files = activeFiles()
+  if (!files.length) {
+    notify('warning', '没有勾选任何文件')
+    running.value = ''
+    barWidth.value = 0
+    return
+  }
   if (!files.length) {
     notify('warning', '没有可处理的文件')
     running.value = ''
@@ -1063,12 +1232,14 @@ async function start() {
   }
 }
 
-function decorateTree(nodes) {
+function decorateTree(nodes, parentRel = '') {
   for (const n of nodes || []) {
     if (n.type === 'dir') {
       n.open = true
-      decorateTree(n.children)
+      n._relDir = parentRel ? `${parentRel}/${n.name}` : n.name
+      decorateTree(n.children, n._relDir)
     } else {
+      n._relDir = parentRel
       n.transferred = false
       delete n.skipped
       if (n.eligible && n.reuse == null) delete n.reuse
@@ -1350,7 +1521,7 @@ onUnmounted(() => {
   text-overflow: ellipsis;
   white-space: nowrap;
   line-height: 20px;
-}.combo .c-text.placeholder { color: var(--text-secondary); }.combo .c-caret { color: var(--text-secondary); flex: 0 0 auto; line-height: 1; }.tree { padding: 6px; height: 300px; overflow: auto; }.tree-host { position: relative; }.tree-empty { color: var(--text-secondary); padding: 28px 12px; text-align: center; }.tree-scan-banner {
+}.combo .c-text.placeholder { color: var(--text-secondary); }.combo .c-caret { color: var(--text-secondary); flex: 0 0 auto; line-height: 1; }.dst-landing { display: flex; align-items: flex-start; gap: 6px; margin: 8px 0 0; padding: 0 2px; font-size: 12px; line-height: 1.5; color: var(--text-secondary); }.dst-landing i { margin-top: 2px; flex-shrink: 0; color: var(--primary-color); }.dst-landing.warn i { color: #d97706; }.tree { padding: 6px; height: 300px; overflow: auto; }.tree-host { position: relative; }.tree-empty { color: var(--text-secondary); padding: 28px 12px; text-align: center; }.tree-select-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 16px; border-bottom: 1px dashed var(--border-color); font-size: 12px; color: var(--text-secondary); }.tree-select-bar .tsb-count b { color: var(--text-main, var(--text)); font-weight: 600; }.tree-select-bar .tsb-actions { display: inline-flex; gap: 6px; }.tsb-btn { font-size: 12px; padding: 2px 10px; border-radius: var(--radius-pill); border: 1px solid var(--border-color); background: transparent; color: var(--text-secondary); cursor: pointer; }.tsb-btn:hover:not(:disabled) { border-color: var(--primary-color); color: var(--primary-color); }.tsb-btn:disabled { opacity: .45; cursor: default; }.tree-scan-banner {
   display: flex; align-items: flex-start; gap: 8px;
   margin: 4px 6px 8px; padding: 8px 10px; border-radius: var(--radius-md);
   font-size: 12px; line-height: 1.45; color: var(--text-secondary);

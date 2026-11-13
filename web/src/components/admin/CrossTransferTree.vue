@@ -3,9 +3,20 @@
     <div
       v-if="node.type === 'dir'"
       class="tnode folder"
+      :class="{ 'is-unchecked': selectable && !isChecked(node) && !isIndeterminate(node) }"
       :style="{ paddingLeft: (6 + depth * 16) + 'px' }"
       @click="toggle(node)"
     >
+      <span
+        v-if="selectable"
+        class="cb"
+        :class="{ on: isChecked(node), half: !isChecked(node) && isIndeterminate(node) }"
+        :title="isChecked(node) ? '取消勾选此目录' : '勾选此目录'"
+        @click.stop="onToggle(node)"
+      >
+        <SvgIcon v-if="!isChecked(node) && isIndeterminate(node)" name="minus" size="0.68em" />
+        <SvgIcon v-else-if="isChecked(node)" name="check" size="0.68em" />
+      </span>
       <span class="caret" :class="{ open: node.open }"><SvgIcon name="chevron-right" size="1em" /></span>
       <span class="t-ic dir"><SvgIcon name="folder" size="1em" /></span>
       <span class="t-name">{{ node.name }}</span>
@@ -16,15 +27,28 @@
       :nodes="node.children || []"
       :mode="mode"
       :depth="depth + 1"
+      :selectable="selectable"
+      :is-checked="isChecked"
+      :is-indeterminate="isIndeterminate"
+      :on-toggle="onToggle"
     />
 
     <div
       v-else-if="node.type === 'file'"
       class="tnode file"
-      :class="{ probing: node.state === 'run' }"
+      :class="{ probing: node.state === 'run', 'is-unchecked': selectable && !isChecked(node) }"
       :data-rel-path="node.rel_path"
       :style="{ paddingLeft: (6 + depth * 16) + 'px' }"
     >
+      <span
+        v-if="selectable"
+        class="cb"
+        :class="{ on: isChecked(node) }"
+        :title="isChecked(node) ? '取消勾选此文件' : '勾选此文件'"
+        @click.stop="onToggle(node)"
+      >
+        <SvgIcon v-if="isChecked(node)" name="check" size="0.68em" />
+      </span>
       <span class="caret-spacer"></span>
       <span class="t-ic file"><SvgIcon name="file" size="1em" /></span>
       <span class="t-name">{{ node.name }}</span>
@@ -47,7 +71,12 @@ defineOptions({ name: 'CrossTransferTree' })
 defineProps({
   nodes: { type: Array, default: () => [] },
   mode: { type: String, default: 'src' },
-  depth: { type: Number, default: 0 }
+  depth: { type: Number, default: 0 },
+  // 勾选：由父组件持有「取消勾选集合」，树只负责展示与回调，避免状态分裂。
+  selectable: { type: Boolean, default: false },
+  isChecked: { type: Function, default: () => true },
+  isIndeterminate: { type: Function, default: () => false },
+  onToggle: { type: Function, default: () => {} },
 })
 
 const toggle = (node) => { node.open = !node.open }
@@ -101,6 +130,14 @@ const statusText = (n) => {
 .tnode:hover { background: rgba(127,127,127,.1); }
 .tnode.file.probing { background: rgba(217,119,6,.12); outline: 1px solid rgba(217,119,6,.25); }
 .tnode.folder { cursor: pointer; }
+.tnode.is-unchecked { opacity: .42; }
+.cb {
+  width: 16px; height: 16px; flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
+  border: 1.5px solid var(--border-color, #cbd5e1); border-radius: 4px;
+  color: #fff; background: transparent; cursor: pointer; transition: background .12s, border-color .12s;
+}
+.cb:hover { border-color: var(--primary-color, #4c74df); }
+.cb.on, .cb.half { background: var(--primary-color, #4c74df); border-color: var(--primary-color, #4c74df); }
 .caret { width: 14px; color: var(--text-secondary, var(--text-muted)); font-size: 12px; transition: transform .14s; flex: 0 0 auto; }
 .caret.open { transform: rotate(90deg); }
 .caret-spacer { width: 14px; flex: 0 0 auto; }
@@ -122,7 +159,8 @@ const statusText = (n) => {
 :global(:root[data-skin="brutal"] .cross-transfer) .tnode,
 :global(:root[data-skin="brutal"] .cross-transfer) .t-ic,
 :global(:root[data-skin="brutal"] .cross-transfer) .folder-count,
-:global(:root[data-skin="brutal"] .cross-transfer) .tag {
+:global(:root[data-skin="brutal"] .cross-transfer) .tag,
+:global(:root[data-skin="brutal"] .cross-transfer) .cb {
   border-radius: 0;
 }
 
