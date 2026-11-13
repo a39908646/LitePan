@@ -1,23 +1,35 @@
+# LitePan 部署（唯一一份）
+#
+# 镜像来自 GHCR，tag 固定 latest；升级 = pull + up -d，版本看镜像 label：
+#   docker image inspect ghcr.io/a39908646/litepan:latest \
+#     --format '{{index .Config.Labels "org.opencontainers.image.version"}}'
+#
+# fnOS 只认项目目录下这一个文件，别指望 `-f` 叠加。升级时 -p 要取已有容器的 project 标签，
+# 目录名推出来的项目名可能和当初创建时不一致：
+#   P=$(docker inspect litepan --format '{{index .Config.Labels "com.docker.compose.project"}}')
+#   docker compose -p "$P" pull && docker compose -p "$P" up -d
+#
+# 挂载路径按你的机器改。fnOS 上实际是绝对路径（/vol1/1000/Mounts、
+# /vol2/1000/disk/Media/litepan 之类），这里用相对路径保持可移植。
+
 services:
   litepan:
-    image: ponphil/litepan:beta
+    image: ghcr.io/a39908646/litepan:latest
     container_name: litepan
     restart: unless-stopped
-    ports:
-      - "5211:5211"
-      # 内置 Magnet 的 TCP/uTP/DHT 监听端口；若在后台修改，需同步调整映射
-      - "42069:42069/tcp"
-      - "42069:42069/udp"
+    # 用宿主网络：Magnet 的 uTP/DHT 才能拿到真实网络，端口不用另做映射
+    network_mode: host
     environment:
       - TZ=Asia/Shanghai
     volumes:
       - ./data:/app/data
       - ./strm:/app/strm
       - ./mounts:/app/mounts:shared
-
-      # 可选：将 FUSE 读缓存单独映射，建议放到更快的磁盘
-      # - ./fuse_read_cache:/app/data/fuse_read_cache
+      # FUSE 写入暂存目录默认在 /app/data/upload_tasks 里，跟着 data 卷走。
+      # 挂载写入的大文件会先完整落盘再上传，data 盘要有同等空闲；空间紧张就单独挂一块盘：
+      # - ./upload_tasks:/app/data/upload_tasks
     devices:
       - /dev/fuse:/dev/fuse
-    pid: "host"
     privileged: true
+    # 某些 mount/umount 行为依赖宿主 PID 命名空间
+    pid: "host"
