@@ -702,6 +702,15 @@ func TestCrossTransferDownloadReleasesSlotBeforeUploadCompletes(t *testing.T) {
 		Accounts: fakeUploadAccounts{},
 		DataDir:  t.TempDir(),
 	})
+	// Stop 要等所有运行协程退出；否则 Windows 上仍有句柄打开着下载临时文件，
+	// 框架删 TempDir 时会报“文件被占用”。Cleanup 晚于 TempDir 注册所以先执行。
+	t.Cleanup(func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := m.Stop(stopCtx); err != nil {
+			t.Errorf("停止上传管理器失败: %v", err)
+		}
+	})
 
 	m.mu.Lock()
 	m.limit = 1
@@ -722,7 +731,7 @@ func TestCrossTransferDownloadReleasesSlotBeforeUploadCompletes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = m.Create(context.Background(), CreateParams{
+	task2, err := m.Create(context.Background(), CreateParams{
 		AccountID:         1,
 		FileName:          "task-2.bin",
 		SourceType:        SourceTypeCrossTransfer,
@@ -766,15 +775,22 @@ func TestCrossTransferDownloadReleasesSlotBeforeUploadCompletes(t *testing.T) {
 	}
 
 	close(drv.release)
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		got, ok := m.Get(context.Background(), task1.TaskID)
-		if ok && got.Status == StatusSuccess {
-			return
+	// 两个任务都跑到终态再收尾：只等任务 1 会留下任务 2 的工作协程，
+	// 它在 Windows 上仍持有下载临时文件句柄，t.TempDir 清理会报“文件被占用”。
+	waitSuccess := func(task *Task) {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			got, ok := m.Get(context.Background(), task.TaskID)
+			if ok && got.Status == StatusSuccess {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
 		}
-		time.Sleep(20 * time.Millisecond)
+		t.Fatalf("任务 %s 未完成", task.FileName)
 	}
-	t.Fatal("首个跨盘任务未完成")
+	waitSuccess(task1)
+	waitSuccess(task2)
 }
 
 func TestResumePendingUploadTaskRunsBeforeNormalPending(t *testing.T) {
