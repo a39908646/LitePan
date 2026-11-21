@@ -218,9 +218,9 @@ type plainScan struct {
 }
 
 type plainScanNode struct {
-	id     string
-	label  string // 展示用路径，只用于错误信息
-	relDir string // 目标侧相对目录；单选一个目录时为空
+	id string
+	// relDir 目标侧相对目录，同时用于错误信息里的展示路径。
+	relDir string
 	depth  int
 }
 
@@ -238,8 +238,7 @@ func (s *Service) enumeratePlainSourcesProgress(ctx context.Context, sourceAccou
 		displayPrefix := sourceRootPrefix(source.DisplayPath)
 		queue = append(queue, plainScanNode{
 			id:     source.ParentID,
-			label:  strings.TrimSuffix(displayPrefix, "/"),
-			relDir: strings.TrimSuffix(targetRootPrefix(displayPrefix, len(roots)), "/"),
+			relDir: strings.TrimSuffix(displayPrefix, "/"),
 			depth:  0,
 		})
 	}
@@ -278,7 +277,6 @@ func (s *Service) enumeratePlainSourcesProgress(ctx context.Context, sourceAccou
 				if item.IsDir {
 					child := plainScanNode{
 						id:     item.ID,
-						label:  joinPlainRelDir(outcome.node.label, item.Name),
 						relDir: joinPlainRelDir(outcome.node.relDir, item.Name),
 						depth:  outcome.node.depth + 1,
 					}
@@ -329,11 +327,8 @@ func joinPlainRelDir(prefix, name string) string {
 	return prefix + "/" + name
 }
 
-// plainNodePath 返回展示用路径，优先取带选区目录名的 label。
+// plainNodePath 返回展示用路径。
 func plainNodePath(node plainScanNode) string {
-	if node.label != "" {
-		return "/" + strings.Trim(node.label, "/")
-	}
 	path := strings.Trim(node.relDir, "/")
 	if path == "" {
 		return "/"

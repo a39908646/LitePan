@@ -18,12 +18,21 @@ func relDirOf(t *testing.T, files []ScanFile) map[string]string {
 	return out
 }
 
+func relPathOf(t *testing.T, files []ScanFile) map[string]string {
+	t.Helper()
+	out := make(map[string]string, len(files))
+	for _, f := range files {
+		out[f.Name] = f.RelPath
+	}
+	return out
+}
+
 func testHash() map[domain.HashType]string {
 	return map[domain.HashType]string{domain.HashMD5: "11111111111111111111111111111111"}
 }
 
-// 单选一个目录时，选区内容直接落进目标目录：目标下不得再重建一层同名目录。
-func TestScanSingleRootLandsDirectlyInTarget(t *testing.T) {
+// 选什么就传什么：选中的目录名必须进目标侧路径，其内子目录结构同样保留。
+func TestScanSingleRootKeepsSelectedDirectory(t *testing.T) {
 	drv := newCleanupDriver()
 	hash := testHash()
 	drv.children["cloudadd"] = []domain.FileItem{
@@ -43,37 +52,40 @@ func TestScanSingleRootLandsDirectlyInTarget(t *testing.T) {
 		t.Fatalf("单目录扫描失败: %v", err)
 	}
 
-	want := map[string]string{"a.mp4": "", "b.mp4": "", "c.mp4": "合集"}
-	got := relDirOf(t, result.Files)
-	for name, dir := range want {
-		if got[name] != dir {
-			t.Fatalf("%s 的目标相对目录应为 %q，实际 %q（完整 %#v）", name, dir, got[name], got)
+	wantDir := map[string]string{
+		"a.mp4": "来自：云添加",
+		"b.mp4": "来自：云添加",
+		"c.mp4": "来自：云添加/合集",
+	}
+	gotDir := relDirOf(t, result.Files)
+	for name, dir := range wantDir {
+		if gotDir[name] != dir {
+			t.Fatalf("%s 的目标相对目录应为 %q，实际 %q", name, dir, gotDir[name])
 		}
 	}
 
-	// 树上同样不应出现选区目录本身：单选时 root 是透明的。
-	for _, node := range result.Tree {
-		if node.Type == "dir" && node.Name == "来自：云添加" {
-			t.Fatalf("扫描树不应再包一层选区目录: %#v", result.Tree)
+	wantPath := map[string]string{
+		"a.mp4": "来自：云添加/a.mp4",
+		"c.mp4": "来自：云添加/合集/c.mp4",
+	}
+	gotPath := relPathOf(t, result.Files)
+	for name, path := range wantPath {
+		if gotPath[name] != path {
+			t.Fatalf("%s 的相对路径应为 %q，实际 %q", name, path, gotPath[name])
 		}
-	}
-
-	relPaths := make(map[string]string, len(result.Files))
-	for _, f := range result.Files {
-		relPaths[f.Name] = f.RelPath
-	}
-	if relPaths["a.mp4"] != "a.mp4" || relPaths["c.mp4"] != "合集/c.mp4" {
-		t.Fatalf("相对路径不应带选区目录前缀: %#v", relPaths)
 	}
 }
 
-// 单目录秒传全链路：目标目录下不得创建任何新目录。
-func TestExecuteSingleRootCreatesNoExtraDirectory(t *testing.T) {
-	drv := newCleanupDriver()
-	hash := testHash()
+// 秒传全链路：目标下重建选中的目录，文件落在该目录（子目录同样重建）里。
+func TestExecuteSingleRootRecreatesSelectedDirectory(t *testing.T) {
+	drv := &rapidHitDriver{cleanupDriver: newCleanupDriver()}
 	drv.children["cloudadd"] = []domain.FileItem{
-		{ID: "f1", Name: "a.mp4", Size: 1, Hash: hash},
-		{ID: "f2", Name: "b.mp4", Size: 1, Hash: hash},
+		{ID: "f1", Name: "a.mp4", Size: 1, Hash: testHash()},
+		{ID: "f2", Name: "b.mp4", Size: 1, Hash: testHash()},
+		{ID: "sub", Name: "合集", IsDir: true},
+	}
+	drv.children["sub"] = []domain.FileItem{
+		{ID: "f3", Name: "c.mp4", Size: 1, Hash: testHash()},
 	}
 	service := newCleanupService(t, drv)
 
@@ -107,14 +119,41 @@ func TestExecuteSingleRootCreatesNoExtraDirectory(t *testing.T) {
 		t.Fatalf("执行失败: %v", err)
 	}
 
+	folderID := ""
 	for _, item := range drv.children["target"] {
-		if item.IsDir {
-			t.Fatalf("目标目录下不应创建子目录，实际创建了 %q", item.Name)
+		if item.IsDir && item.Name == "来自：云添加" {
+			folderID = item.ID
 		}
+	}
+	if folderID == "" {
+		t.Fatalf("目标下应重建选中的目录，actual=%#v", drv.children["target"])
+	}
+	names := map[string]bool{}
+	for _, item := range drv.children[folderID] {
+		names[item.Name] = item.IsDir
+	}
+	for _, want := range []string{"a.mp4", "b.mp4"} {
+		if isDir, ok := names[want]; !ok || isDir {
+			t.Fatalf("选中的目录下应有文件 %q，actual=%#v", want, names)
+		}
+	}
+
+	// 选区内的子目录也要在目标侧重建，且文件落在子目录里（不能拍平）。
+	subID := ""
+	for _, item := range drv.children[folderID] {
+		if item.IsDir && item.Name == "合集" {
+			subID = item.ID
+		}
+	}
+	if subID == "" {
+		t.Fatalf("选中的目录下应重建子目录 合集，actual=%#v", drv.children[folderID])
+	}
+	if len(drv.children[subID]) != 1 || drv.children[subID][0].Name != "c.mp4" {
+		t.Fatalf("子目录 合集 下应有且仅有 c.mp4，actual=%#v", drv.children[subID])
 	}
 }
 
-// 多选目录时保留各自目录名：与扫描树上显示的目录节点一致，也避免同名文件互相覆盖。
+// 多选目录时同样保留各自目录名，与扫描树上显示的目录节点一致。
 func TestScanMultiRootKeepsDirectoryNames(t *testing.T) {
 	drv := newCleanupDriver()
 	hash := testHash()
@@ -143,8 +182,8 @@ func TestScanMultiRootKeepsDirectoryNames(t *testing.T) {
 	}
 }
 
-// 普传链路必须与秒传一致：单选目录时同样不重建同名目录。
-func TestPlainSingleRootLandsDirectlyInTarget(t *testing.T) {
+// 普传链路必须与秒传一致：单选目录时同样重建同名目录。
+func TestPlainSingleRootKeepsSelectedDirectory(t *testing.T) {
 	drv := newCleanupDriver()
 	drv.children["cloudadd"] = []domain.FileItem{
 		{ID: "f1", Name: "a.mp4", Size: 1},
@@ -160,7 +199,7 @@ func TestPlainSingleRootLandsDirectlyInTarget(t *testing.T) {
 		t.Fatalf("普传枚举失败: %v", err)
 	}
 
-	want := map[string]string{"a.mp4": "", "c.mp4": "合集"}
+	want := map[string]string{"a.mp4": "来自：云添加", "c.mp4": "来自：云添加/合集"}
 	for _, f := range scan.files {
 		if f.relDir != want[f.name] {
 			t.Fatalf("%s 的目标相对目录应为 %q，实际 %q", f.name, want[f.name], f.relDir)
@@ -168,7 +207,7 @@ func TestPlainSingleRootLandsDirectlyInTarget(t *testing.T) {
 	}
 }
 
-// 报错信息仍要带完整展示路径，剥掉的是目标落点，不是诊断信息。
+// 报错信息要带完整展示路径（含选区目录名）。
 func TestScanSingleRootErrorKeepsDisplayPath(t *testing.T) {
 	drv := newCleanupDriver()
 	drv.children["cloudadd"] = []domain.FileItem{{ID: "broken", Name: "损坏目录", IsDir: true}}

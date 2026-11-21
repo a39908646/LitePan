@@ -49,7 +49,7 @@ function openRapidMatrix() {
       <CrossDrivePlainTransfer />
     </div>
     <div v-show="activeTab === RAPID_TAB" class="ctp-pane">
-      <CrossDriveTransfer ref="rapidViewRef" />
+      <CrossDriveTransfer ref="rapidViewRef" :active="activeTab === RAPID_TAB" />
     </div>
   </div>
 </template>

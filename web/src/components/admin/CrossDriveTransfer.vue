@@ -342,6 +342,12 @@ import SvgIcon from "@/components/icons/SvgIcon.vue";
 
 const { confirm, showConfirm } = useConfirm();
 
+// active：当前是否停在「跨盘秒传」页签。父级用 v-show 保活两个页签，
+// 所以子组件在普传页签下也是挂载的，不能自己无条件弹线路面板。
+const props = defineProps({
+  active: { type: Boolean, default: true },
+})
+
 const SOFT_FOLDER_LIMIT = 10
 const router = useRouter()
 
@@ -425,7 +431,7 @@ function subtreeKeys(node, out = []) {
   return out
 }
 
-// 同时统计子树里的文件数与已取消数，半选状态与「保留目录结构」判定共用。
+// 同时统计子树里的文件数与已取消数，用于半选状态。
 function subtreeStats(node) {
   if (node.type === 'file') return { total: 1, off: isDeselected(node) ? 1 : 0 }
   let total = 0
@@ -473,43 +479,12 @@ const selectedFileCount = computed(() =>
   (probeFiles.value || []).filter(f => !deselected.value.has(fileKey(f.rel_path))).length,
 )
 
-// 每个目录下「文件总数 / 保留数」，用 rel_dir 作为键。
-function dirFileCounts() {
-  const out = {}
-  const walk = (nodes) => {
-    let total = 0
-    let kept = 0
-    for (const n of nodes || []) {
-      if (n.type === 'dir') {
-        const c = walk(n.children)
-        total += c.total
-        kept += c.kept
-        out[n._relDir] = c
-      } else {
-        total++
-        if (!deselected.value.has(fileKey(n.rel_path))) kept++
-      }
-    }
-    return { total, kept }
-  }
-  const root = walk(srcTree.value)
-  if (!('' in out)) out[''] = root
-  return out
-}
-
-// 交给后端执行的文件集：未全选时重算落点。
-// 目录被整体勾选 → 保留目录结构；只挑了几散文件 → 直接放目标目录。
+// 交给后端执行的文件集：勾选只决定「传哪些文件」，不改落点。
+// 目标侧始终按源侧目录结构落盘（选什么就传什么），取消勾选等于该文件不传。
 function activeFiles() {
   const all = orderFilesByTree(probeFiles.value)
   if (!deselected.value.size) return all
-  const kept = all.filter(f => !deselected.value.has(fileKey(f.rel_path)))
-  const counts = dirFileCounts()
-  return kept.map(f => {
-    const s = counts[f.rel_dir]
-    const keepStructure = s ? s.kept === s.total : false
-    // 只改落点目录，保留原 rel_path：它是传输事件与树上节点的唯一标识。
-    return keepStructure ? f : { ...f, rel_dir: '' }
-  })
+  return all.filter(f => !deselected.value.has(fileKey(f.rel_path)))
 }
 
 // effectiveRoots 复刻后端 normalizeScanRoots 的嵌套去重：选中 /a 和 /a/b 时只算 /a。
@@ -527,21 +502,21 @@ const effectiveRoots = computed(() => {
   )
 })
 
-// 目标落点：单选目录时，选区内容直接放进目标目录；多选时各自保留目录名。
+// 目标落点：选中的目录连同其内结构原样进入目标目录（选什么就传什么）。
 const dstLandingMulti = computed(() => effectiveRoots.value.length > 1)
 const dstLanding = computed(() => {
   if (!dst.value) return ''
   const base = (dst.value.path || '/').replace(/\/+$/, '') || '/'
   const roots = effectiveRoots.value
   if (!roots.length) return ''
-  if (deselected.value.size > 0) {
-    return `实际落点：${base}（按树上勾选决定：完整勾选的目录保留目录名，散选的文件直接放入）`
-  }
+  const prefixed = base === '/' ? '' : base
   if (roots.length === 1) {
-    return `实际落点：${base}（选区内的文件直接放在这里，不再新建同名目录）`
+    const name = roots[0].name
+    if (!name) return `实际落点：${base}（选的是根目录，没有目录名可建）`
+    return `实际落点：${prefixed}/${name}/（目录连同其内文件一起传）`
   }
   const names = roots.map(item => item.name || '目录').join('、')
-  return `实际落点：${base === '/' ? '' : base}/<${names}>（多选保留各自目录名）`
+  return `实际落点：${prefixed}/<${names}>/（各目录连同其内文件一起传）`
 })
 
 const accounts = ref([])
@@ -783,6 +758,11 @@ function createFileRunContext(fileList) {
 
 const matrixOpen = ref(false)
 const mxSelected = ref(null)
+// 线路是必选项：激活页面时若还没选线路，就自动把面板弹出来。
+const routesLoaded = ref(false)
+let autoOpenPending = false
+// 同一时刻只允许一个线路拉取请求；失败后允许在再次激活页面时重试。
+let routesAttempting = false
 const statusText = computed(() => {
   if (!selectedView.value) return "请选择线路";
   return `已选：${selectedView.value.from.name} → ${selectedView.value.to.name}（${selectedView.value.method_label}）`;
@@ -800,6 +780,18 @@ function openMatrix() {
   mxSelected.value = null
   matrixOpen.value = true
 }
+// 只有「一条线路都没选」时才自动弹；已选过或面板已打开就不打扰。
+function openMatrixIfNeeded() {
+  if (curRoute.value || matrixOpen.value) return
+  if (!routesLoaded.value) {
+    // 线路还没拉到（或上次拉取失败）：记下待弹，并触发/重试拉取。
+    // routesAttempting 守卫保证不会重复发请求。
+    autoOpenPending = true
+    void loadRoutes()
+    return
+  }
+  openMatrix()
+}
 function onMatrixPatchSelect(route, reversed) {
   mxSelected.value = { route, reversed: Boolean(reversed) }
 }
@@ -812,7 +804,7 @@ function applyMatrixSelection() {
   reset()
   matrixOpen.value = false
 }
-defineExpose({ openMatrix })
+defineExpose({ openMatrix, openMatrixIfNeeded })
 function swap() {
   if (!curRoute.value || !curRoute.value.bidirectional) return
   swapped.value = !swapped.value
@@ -1103,12 +1095,6 @@ async function start() {
     barWidth.value = 0
     return
   }
-  if (!files.length) {
-    notify('warning', '没有可处理的文件')
-    running.value = ''
-    barWidth.value = 0
-    return
-  }
 
   const { nodeMap, fileMap, orderedPaths, setNodeRun, clearAllRun, scrollToFile } = createFileRunContext(files)
   if (orderedPaths.length) {
@@ -1315,11 +1301,24 @@ function normalizeRouteDirection(route) {
 }
 
 async function loadRoutes() {
+  // 失败后允许在再次激活页面时重试，但同一时刻只跑一个请求。
+  if (routesAttempting) return
+  routesAttempting = true
   try {
     routes.value = (await listCrossTransferRoutes()).map(normalizeRouteDirection)
     // 默认不选中线路：先让用户在矩阵/配线架中选择
+    routesLoaded.value = true
+    if (autoOpenPending) {
+      autoOpenPending = false
+      if (props.active) openMatrixIfNeeded()
+    }
   } catch (e) {
+    // 拉不到线路时不弹空面板（那会谎报「暂无可用的秒传组合」），
+    // 清掉待弹标记，下次激活页面时再重试。
+    autoOpenPending = false
     notify('error', '获取线路失败: ' + (e instanceof Error ? e.message : String(e)))
+  } finally {
+    routesAttempting = false
   }
 }
 async function loadAccounts() {
@@ -1419,6 +1418,8 @@ function deactivateUi() {
   uiActive = false
   settingsOpen.value = false
   pickerOpen.value = false
+  // 线路面板也是 Teleport 到 body 的弹层，不关会在切页后残留。
+  matrixOpen.value = false
   stopFooterTipTimer()
   document.removeEventListener('click', onDocClick)
   window.removeEventListener('scroll', onSettingsReposition, true)
@@ -1430,8 +1431,16 @@ onMounted(() => {
   loadRoutes()
   loadAccounts()
 })
-onActivated(activateUi)
+onActivated(() => {
+  activateUi()
+  // 从别的页面切回本页：只要没选线路，继续把面板弹出来。
+  if (props.active) openMatrixIfNeeded()
+})
 onDeactivated(deactivateUi)
+// 页签切换不会重新挂载组件，靠 active 变化触发自动弹层。
+watch(() => props.active, (active) => {
+  if (active) openMatrixIfNeeded()
+}, { immediate: true })
 onUnmounted(() => {
   abortCtrl.value?.abort()
   deactivateUi()

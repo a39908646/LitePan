@@ -99,18 +99,10 @@ type ExecuteInput struct {
 	Fallback          bool
 }
 
-// targetRootPrefix 决定选区目录名是否进入目标侧相对路径。
+// sourceRootPrefix 取选区目录名作为目标侧落点的第一层。
 //
-// 单选一个目录时，用户看到的目标目录就是落点所在，因此选区内容直接放进去，
-// 不再在目标下重建一层同名目录（所见即所得）。多选时无法区分同名文件，
-// 保留各自目录名，与扫描树上显示的目录节点一致。
-func targetRootPrefix(displayPrefix string, rootCount int) string {
-	if rootCount == 1 {
-		return ""
-	}
-	return displayPrefix
-}
-
+// 选什么就传什么：选中的目录本身连同其内结构都进入目标路径，
+// 选的是根目录时目录名为空，文件自然落在目标根下。
 func sourceRootPrefix(displayPath string) string {
 	parts := strings.Split(strings.Trim(strings.TrimSpace(displayPath), "/"), "/")
 	var cleaned []string
@@ -166,10 +158,9 @@ type scanProgress struct {
 }
 
 type scanDirNode struct {
-	id    string
-	name  string
-	label string // 展示用路径前缀（始终含选区目录名），只用于进度与错误信息
-	// relPrefix 目标侧相对目录前缀。单选一个目录时为空：选区内容直接落进目标目录。
+	id   string
+	name string
+	// relPrefix 目标侧相对目录前缀，同时用于进度与错误信息里的展示路径。
 	relPrefix string
 	depth     int
 	dirs      []*scanDirNode
@@ -278,8 +269,7 @@ func (s *Service) scanSources(
 		rootNodes = append(rootNodes, &scanDirNode{
 			id:        source.ParentID,
 			name:      strings.TrimSuffix(displayPrefix, "/"),
-			label:     displayPrefix,
-			relPrefix: targetRootPrefix(displayPrefix, len(roots)),
+			relPrefix: displayPrefix,
 		})
 	}
 	queue := append([]*scanDirNode(nil), rootNodes...)
@@ -317,7 +307,6 @@ func (s *Service) scanSources(
 				child := &scanDirNode{
 					id:        item.ID,
 					name:      item.Name,
-					label:     listed.node.label + item.Name + "/",
 					relPrefix: listed.node.relPrefix + item.Name + "/",
 					depth:     listed.node.depth + 1,
 				}
@@ -423,10 +412,7 @@ func scanDirPath(node *scanDirNode) string {
 	if node == nil {
 		return "/"
 	}
-	path := strings.Trim(strings.TrimSpace(node.label), "/")
-	if path == "" {
-		path = strings.Trim(strings.TrimSpace(node.relPrefix), "/")
-	}
+	path := strings.Trim(strings.TrimSpace(node.relPrefix), "/")
 	if path == "" {
 		return "/"
 	}
