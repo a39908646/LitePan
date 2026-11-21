@@ -21,6 +21,8 @@ export type FolderSelection = {
   name: string;
   path?: string;
   ancestorIds?: string[];
+  // 选中的是一个文件（不是目录）：下游据此决定落点（文件直接放目标目录）。
+  isFile?: boolean;
 };
 
 const ROOT: Crumb = { id: "", name: "根目录" };
@@ -46,6 +48,8 @@ const props = withDefaults(
     rootAnchor?: { parentId: string; path: string; label?: string };
     // 同层多选子目录。
     multiSelect?: boolean;
+    // 允许把文件也列为可选项（源侧选文件）；目录仍可进入，文件不可进入。
+    allowFiles?: boolean;
     // 多选值仍表示被选中的目录，但复选框反向显示：未勾选代表命中该值。
     inverseSelectionDisplay?: boolean;
     // 受控已选目录；传入后跨目录浏览保留，并由父组件汇总。
@@ -71,6 +75,7 @@ const props = withDefaults(
     initialPath: "",
     rootAnchor: undefined,
     multiSelect: false,
+    allowFiles: false,
     inverseSelectionDisplay: false,
     selectedItems: undefined,
     showClose: true,
@@ -243,6 +248,7 @@ function selectionForDir(dir: FileItem): FolderSelection {
     name: dir.name || String(dir.id),
     path: normalizedSelectionPath(`${base}/${dir.name || ""}`),
     ancestorIds: [...currentAncestorIds.value],
+    isFile: dir.is_dir ? undefined : true,
   };
 }
 
@@ -349,7 +355,8 @@ async function listDirs(parentId: string, opts?: { forceRefresh?: boolean }): Pr
     return props.loader(parentId, opts);
   }
   const res = await filesApi.list(props.accountId, parentId, opts);
-  return res.items.filter((it) => it.is_dir);
+  // allowFiles：文件也列出来供勾选（源侧选单个文件）；否则保持只列目录。
+  return props.allowFiles ? res.items : res.items.filter((it) => it.is_dir);
 }
 
 async function resolveInitialBreadcrumb(): Promise<Crumb[]> {
@@ -396,7 +403,7 @@ async function resetAndLoad() {
 const excludedSet = computed(() => new Set(props.excludedFolderIds.map(String)));
 
 const visibleDirs = computed(() =>
-  dirs.value.filter((d) => d.is_dir && !excludedSet.value.has(String(d.id))),
+  dirs.value.filter((d) => (props.allowFiles || d.is_dir) && !excludedSet.value.has(String(d.id))),
 );
 
 const filteredDirs = computed(() => {
@@ -517,6 +524,15 @@ function openDir(dir: FileItem) {
   resetCreateState();
   clearSelection();
   void load(dir.id);
+}
+
+// 行点击：目录进入下一层；文件不可进入，多选下等同于勾选该文件。
+function onRowActivate(dir: FileItem) {
+  if (dir.is_dir) {
+    openDir(dir);
+    return;
+  }
+  if (props.multiSelect) toggleDisplaySelect(dir);
 }
 
 function goTo(index: number) {
@@ -692,13 +708,13 @@ watch(
         <label
           v-if="showSearch"
           class="folder-selector__search"
-          title="仅筛选当前目录下已加载的文件夹"
+          :title="allowFiles ? '仅筛选当前目录下已加载的目录与文件' : '仅筛选当前目录下已加载的文件夹'"
         >
           <span class="folder-selector__search-icon"><SvgIcon name="badge-search" :size="16" /></span>
           <input
             v-model.trim="filterKeyword"
             type="search"
-            placeholder="筛选当前目录文件夹"
+            :placeholder="allowFiles ? '筛选当前目录目录/文件' : '筛选当前目录文件夹'"
             :disabled="loading"
             maxlength="100"
           />
@@ -851,7 +867,9 @@ watch(
               <div v-if="loading" class="folder-state">加载中…</div>
               <div v-else-if="error" class="folder-state error">{{ error }}</div>
               <div v-else-if="!sortedDirs.length && !showCreateInput" class="folder-state">
-                {{ filterKeyword ? "当前目录没有匹配的文件夹" : "没有子目录" }}
+                {{ filterKeyword
+                  ? (allowFiles ? "当前目录没有匹配的目录或文件" : "当前目录没有匹配的文件夹")
+                  : (allowFiles ? "没有可选的目录或文件" : "没有子目录") }}
               </div>
               <template v-else>
                 <div
@@ -860,8 +878,9 @@ watch(
                   class="folder-table-row"
                   :class="{
                     selected: multiSelect && !inverseSelectionDisplay && (isSelected(dir) || isPartialSelected(dir)),
+                    'is-file': !dir.is_dir,
                   }"
-                  @click="openDir(dir)"
+                  @click="onRowActivate(dir)"
                 >
                   <label
                     v-if="multiSelect"
@@ -885,7 +904,7 @@ watch(
                     />
                   </label>
                   <div class="folder-name-cell">
-                    <span class="folder-name-icon"><SvgIcon name="badge-folder" :size="18" /></span>
+                    <span class="folder-name-icon"><SvgIcon :name="dir.is_dir ? 'badge-folder' : 'badge-file'" :size="18" /></span>
                     <span class="folder-name-text" :title="dir.name">{{ dir.name }}</span>
                   </div>
                   <span class="folder-time-cell">
@@ -1389,6 +1408,13 @@ watch(
 }
 .folder-table-row:hover {
   background: var(--surface-sunken);
+}
+/* 文件行不可进入下一层：光标保持箭头，只参与勾选。 */
+.folder-table-row.is-file {
+  cursor: default;
+}
+.folder-table-row.is-file .folder-name-icon {
+  color: var(--text-muted);
 }
 .folder-name-cell {
   min-width: 0;

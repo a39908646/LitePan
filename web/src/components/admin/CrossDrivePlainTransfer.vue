@@ -24,6 +24,8 @@ interface SourceSel {
   name: string;
   path: string;
   ancestorIds: string[];
+  // 选中的是单个文件：落点平铺到目标目录。
+  isFile?: boolean;
 }
 
 interface DstSel {
@@ -153,6 +155,7 @@ function onPickerResolve(payload: {
             name: item.name || item.path?.split("/").filter(Boolean).pop() || "根目录",
             path: item.path || "/",
             ancestorIds: [...(item.ancestorIds || [])],
+            isFile: Boolean(item.isFile),
           }))
         : [{
             parentId: payload.parentId,
@@ -166,7 +169,7 @@ function onPickerResolve(payload: {
       accDriverType: acc?.driver_type || "",
       sources: selected,
     };
-    toast.success(`已选择 ${selected.length} 个源目录`);
+    toast.success(`已选择 ${selected.length} 项`);
   } else {
     dst.value = {
       accId: payload.accountId,
@@ -221,6 +224,7 @@ async function startTransfer() {
         parent_id: item.parentId,
         display_path: item.path || "/",
         ancestor_ids: item.ancestorIds,
+        is_file: Boolean(item.isFile),
       })),
       conflict: conflict.value,
     })) {
@@ -302,9 +306,9 @@ async function startTransfer() {
                 <SvgIcon name="folder" size="1em" />
                 <span class="src-item-path" :title="item.path">{{ item.path || "/" }}</span>
               </div>
-              <p class="src-tip"><SvgIcon name="circle-info" size="1em" /> 将保留目录结构、包含全部子目录与文件</p>
+              <p class="src-tip"><SvgIcon name="circle-info" size="1em" /> 目录保留目录结构、含全部子目录与文件；单选的文件直接放目标目录</p>
             </div>
-            <div v-else class="tree-empty">选择源目录后，将按目录整树传输，不探测秒传指纹</div>
+            <div v-else class="tree-empty">选择源目录或文件后，将按源结构传输，不探测秒传指纹</div>
           </div>
         </div>
 
@@ -411,9 +415,10 @@ async function startTransfer() {
       :account-id="pickerInitialAccountId"
       :initial-path="pickerInitialPath"
       :multi-select="pickerMulti"
+      :allow-files="pickerMode === 'src'"
       :initial-location-mode="pickerLocationMode"
       :selection-restore-mode="pickerMode === 'src' ? 'reset' : 'preserve'"
-      :title="pickerMode === 'src' ? '选择源目录（可多选）' : '选择目标目录'"
+      :title="pickerMode === 'src' ? '选择源目录或文件（可多选）' : '选择目标目录'"
       :confirm-text="pickerMode === 'src' ? '确认选择' : '选择当前目录'"
       show-refresh
       @close="pickerOpen = false"

@@ -446,7 +446,7 @@ func TestScanSourcesRejectsDuplicateRootNames(t *testing.T) {
 		{ParentID: "a", DisplayPath: "/A/电影"},
 		{ParentID: "b", DisplayPath: "/B/电影"},
 	}, "md5")
-	if err == nil || !strings.Contains(err.Error(), "同名文件夹") {
+	if err == nil || !strings.Contains(err.Error(), "同名项") {
 		t.Fatalf("同名根目录应拒绝合并，得到 %v", err)
 	}
 }

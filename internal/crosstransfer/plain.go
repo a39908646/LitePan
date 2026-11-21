@@ -235,6 +235,36 @@ func (s *Service) enumeratePlainSourcesProgress(ctx context.Context, sourceAccou
 	acc := &plainScan{}
 	queue := make([]plainScanNode, 0, len(roots))
 	for _, source := range roots {
+		if source.IsFile {
+			// 文件根：不列目录，直接按平铺（relDir 为空）入队。
+			item, err := s.files.Info(ctx, sourceAccountID, source.ParentID)
+			if err != nil {
+				return nil, fmt.Errorf("读取文件 %s 失败: %w", strings.TrimSpace(source.DisplayPath), err)
+			}
+			if item == nil {
+				return nil, domain.Errorf(domain.CodeValidation, "源文件不存在: %s", source.DisplayPath)
+			}
+			if item.IsDir {
+				return nil, domain.Errorf(domain.CodeValidation, "%s 是目录，不能当作文件处理", source.DisplayPath)
+			}
+			if len(acc.files) >= maxScanFiles {
+				acc.truncated = true
+				acc.truncatedReason = fmt.Sprintf("文件数量超过 %d 个，已停止枚举，请分批选择目录", maxScanFiles)
+				break
+			}
+			name := strings.TrimSpace(item.Name)
+			if name == "" {
+				name = strings.TrimSuffix(sourceRootPrefix(source.DisplayPath), "/")
+			}
+			acc.files = append(acc.files, plainScanFile{
+				id:      item.ID,
+				name:    name,
+				size:    item.Size,
+				relDir:  "",
+				relPath: name,
+			})
+			continue
+		}
 		displayPrefix := sourceRootPrefix(source.DisplayPath)
 		queue = append(queue, plainScanNode{
 			id:     source.ParentID,

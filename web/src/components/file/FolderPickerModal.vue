@@ -26,6 +26,8 @@ const props = withDefaults(
     rootAnchor?: { parentId: string; path: string; label?: string };
     multiSelect?: boolean;
     initialSelections?: FolderSelection[];
+    // 源侧选择：允许把文件也列为可选项（选单个文件传输）。
+    allowFiles?: boolean;
     initialLocationMode?: "preserve" | "root";
     selectionRestoreMode?: "preserve" | "reset";
   }>(),
@@ -42,6 +44,7 @@ const props = withDefaults(
     initialPath: "",
     rootAnchor: undefined,
     multiSelect: false,
+    allowFiles: false,
     initialSelections: () => [],
     initialLocationMode: "preserve",
     selectionRestoreMode: "preserve",
@@ -312,6 +315,7 @@ function onResolve(folder: {
           :initial-path="selAccount === accountId ? effectiveInitialPath : ''"
           :root-anchor="selAccount === accountId ? effectiveRootAnchor : undefined"
           :multi-select="multiSelect"
+          :allow-files="allowFiles"
           :selected-items="multiSelect ? selectedItems : undefined"
           :favorites="favorites"
           :favorites-loading="favoritesLoading"

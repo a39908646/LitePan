@@ -73,6 +73,9 @@ type ScanRoot struct {
 	ParentID    string   `json:"parent_id"`
 	DisplayPath string   `json:"display_path"`
 	AncestorIDs []string `json:"ancestor_ids,omitempty"`
+	// IsFile 表示这个 root 本身就是一个文件（不是目录）：不列目录，
+	// 直接当一条扫描记录，且落点平铺到目标目录下。
+	IsFile bool `json:"is_file,omitempty"`
 }
 
 type TransferFile struct {
@@ -165,6 +168,9 @@ type scanDirNode struct {
 	depth     int
 	dirs      []*scanDirNode
 	files     []scanFileRec
+	// isFileRoot 表示这个 root 本身就是一个文件：不进 BFS，不建目录，直接落目标根。
+	isFileRoot bool
+	file       *scanFileRec
 }
 
 type scanDirResult struct {
@@ -236,12 +242,16 @@ func normalizeScanRoots(roots []ScanRoot) ([]ScanRoot, error) {
 	names := make(map[string]struct{}, len(out))
 	for _, root := range out {
 		name := strings.TrimSuffix(sourceRootPrefix(root.DisplayPath), "/")
+		if root.IsFile && name == "" {
+			return nil, domain.Errorf(domain.CodeValidation, "源文件路径无效: %q", root.DisplayPath)
+		}
 		if len(out) > 1 && name == "" {
 			return nil, domain.Errorf(domain.CodeValidation, "根目录不能与其他目录同时选择")
 		}
 		key := strings.ToLower(name)
 		if _, ok := names[key]; ok {
-			return nil, domain.Errorf(domain.CodeValidation, "所选源目录存在同名文件夹 %q，请分批传输", name)
+			// 文件平铺到目标目录，同名文件会互相覆盖，直接拒绝比默默覆盖好。
+			return nil, domain.Errorf(domain.CodeValidation, "所选源目录/文件存在同名项 %q，请分批传输", name)
 		}
 		names[key] = struct{}{}
 	}
@@ -265,6 +275,19 @@ func (s *Service) scanSources(
 	acc := &scanAccumulator{files: make([]scanFileRec, 0, 256)}
 	rootNodes := make([]*scanDirNode, 0, len(roots))
 	for _, source := range roots {
+		if source.IsFile {
+			rec, err := s.scanFileRoot(ctx, sourceAccountID, source, methodID)
+			if err != nil {
+				return nil, err
+			}
+			rootNodes = append(rootNodes, &scanDirNode{
+				id:         source.ParentID,
+				name:       rec.name,
+				isFileRoot: true,
+				file:       rec,
+			})
+			continue
+		}
 		displayPrefix := sourceRootPrefix(source.DisplayPath)
 		rootNodes = append(rootNodes, &scanDirNode{
 			id:        source.ParentID,
@@ -272,7 +295,21 @@ func (s *Service) scanSources(
 			relPrefix: displayPrefix,
 		})
 	}
-	queue := append([]*scanDirNode(nil), rootNodes...)
+
+	// 文件根不进 BFS 队列，直接计入扫描结果。
+	queue := make([]*scanDirNode, 0, len(rootNodes))
+	for _, node := range rootNodes {
+		if !node.isFileRoot {
+			queue = append(queue, node)
+			continue
+		}
+		if acc.count >= maxScanFiles {
+			acc.truncatedReason = fmt.Sprintf("文件数量超过 %d 个", maxScanFiles)
+			break
+		}
+		acc.files = append(acc.files, *node.file)
+		acc.count++
+	}
 
 	for len(queue) > 0 && acc.truncatedReason == "" {
 		if err := ctx.Err(); err != nil {
@@ -430,26 +467,37 @@ func buildScanTree(node *scanDirNode) []ScanTreeNode {
 		})
 	}
 	for _, rec := range node.files {
-		out = append(out, ScanTreeNode{
-			Type:     "file",
-			ID:       rec.id,
-			Name:     rec.name,
-			RelPath:  rec.relPath,
-			RelDir:   rec.relDir,
-			Size:     rec.size,
-			Hash:     rec.hash,
-			Eligible: rec.hash != "",
-		})
+		out = append(out, scanFileNode(rec))
 	}
 	return out
 }
 
+func scanFileNode(rec scanFileRec) ScanTreeNode {
+	return ScanTreeNode{
+		Type:     "file",
+		ID:       rec.id,
+		Name:     rec.name,
+		RelPath:  rec.relPath,
+		RelDir:   rec.relDir,
+		Size:     rec.size,
+		Hash:     rec.hash,
+		Eligible: rec.hash != "",
+	}
+}
+
 func buildScanRootsTree(roots []*scanDirNode) []ScanTreeNode {
-	if len(roots) == 1 {
+	if len(roots) == 1 && !roots[0].isFileRoot {
 		return buildScanTree(roots[0])
 	}
 	out := make([]ScanTreeNode, 0, len(roots))
 	for _, root := range roots {
+		if root.isFileRoot {
+			// 文件根本身就是一条记录，不再包装成目录节点。
+			if root.file != nil {
+				out = append(out, scanFileNode(*root.file))
+			}
+			continue
+		}
 		out = append(out, ScanTreeNode{
 			Type:     "dir",
 			ID:       root.id,
@@ -521,7 +569,51 @@ func countShallowDirs(tree []ScanTreeNode) int {
 	return total
 }
 
-func (s *Service) resolveHash(ctx context.Context, accountID int64, item *domain.FileItem, methodID string, allowStream bool) (string, error) {
+// scanFileRoot 把「选中的单个文件」变成一条扫描记录：
+//
+// 不列目录，relDir 为空、relPath 就是文件名，所以它会直接落进目标目录；
+// 指纹与豁免判定口径跟目录里搜出来的文件完全一致。
+func (s *Service) scanFileRoot(
+	ctx context.Context,
+	sourceAccountID int64,
+	root ScanRoot,
+	methodID string,
+) (*scanFileRec, error) {
+	item, err := s.files.Info(ctx, sourceAccountID, root.ParentID)
+	if err != nil {
+		return nil, fmt.Errorf("读取文件 %s 失败: %w", strings.TrimSpace(root.DisplayPath), err)
+	}
+	if item == nil {
+		return nil, domain.Errorf(domain.CodeValidation, "源文件不存在: %s", root.DisplayPath)
+	}
+	if item.IsDir {
+		return nil, domain.Errorf(domain.CodeValidation, "%s 是目录，不能当作文件处理", root.DisplayPath)
+	}
+	hash, err := s.resolveHash(ctx, sourceAccountID, item, methodID, false)
+	if err != nil {
+		return nil, fmt.Errorf("读取文件 %s 指纹失败: %w", root.DisplayPath, err)
+	}
+	name := strings.TrimSpace(item.Name)
+	if name == "" {
+		name = strings.TrimSuffix(sourceRootPrefix(root.DisplayPath), "/")
+	}
+	return &scanFileRec{
+		id:      item.ID,
+		name:    name,
+		size:    item.Size,
+		hash:    hash,
+		relPath: name,
+		relDir:  "",
+	}, nil
+}
+
+func (s *Service) resolveHash(
+	ctx context.Context,
+	accountID int64,
+	item *domain.FileItem,
+	methodID string,
+	allowStream bool,
+) (string, error) {
 	if h := driver.HashFromItem(item, methodID); h != "" {
 		return h, nil
 	}

@@ -66,7 +66,7 @@
             :is-indeterminate="isNodeIndeterminate"
             :on-toggle="toggleNodeCheck"
           />
-          <div v-else-if="!phaseStatus" class="tree-empty">选择源目录后，扫描/试探会在此显示文件与秒传状态</div>
+          <div v-else-if="!phaseStatus" class="tree-empty">选择源目录或文件后，扫描/试探会在此显示文件与秒传状态</div>
           <div v-if="phaseStatus && (!srcTree || !srcTree.length)" class="tree-phase-fill">
             <div class="tree-phase-card">
               <BusySpinner class="tree-phase-spin" :size="22" color="var(--primary-color)" />
@@ -268,9 +268,10 @@
       :account-id="pickerInitialAccountId"
       :initial-path="pickerInitialPath"
       :multi-select="pickerMode === 'src'"
+      :allow-files="pickerMode === 'src'"
       :initial-location-mode="pickerMode === 'src' ? 'root' : 'preserve'"
       :selection-restore-mode="pickerMode === 'src' ? 'reset' : 'preserve'"
-      :title="pickerMode === 'src' ? '选择源目录' : '选择目标目录'"
+      :title="pickerMode === 'src' ? '选择源目录或文件' : '选择目标目录'"
       :confirm-text="pickerMode === 'src' ? '确认选择' : '选择当前目录'"
       show-refresh
       @close="pickerOpen = false"
@@ -502,7 +503,7 @@ const effectiveRoots = computed(() => {
   )
 })
 
-// 目标落点：选中的目录连同其内结构原样进入目标目录（选什么就传什么）。
+// 目标落点：选中的目录连同其内结构原样进入目标目录，选中的文件直接放目标目录。
 const dstLandingMulti = computed(() => effectiveRoots.value.length > 1)
 const dstLanding = computed(() => {
   if (!dst.value) return ''
@@ -510,12 +511,20 @@ const dstLanding = computed(() => {
   const roots = effectiveRoots.value
   if (!roots.length) return ''
   const prefixed = base === '/' ? '' : base
-  if (roots.length === 1) {
-    const name = roots[0].name
+  const files = roots.filter(item => item.isFile)
+  const dirs = roots.filter(item => !item.isFile)
+  if (!dirs.length) {
+    const names = files.map(item => item.name || '文件')
+    if (names.length === 1) return `实际落点：${prefixed}/${names[0]}（选的是文件，直接放这里）`
+    return `实际落点：${prefixed}/<${names.join('、')}>（选的是文件，直接放这里）`
+  }
+  if (dirs.length === 1 && !files.length) {
+    const name = dirs[0].name
     if (!name) return `实际落点：${base}（选的是根目录，没有目录名可建）`
     return `实际落点：${prefixed}/${name}/（目录连同其内文件一起传）`
   }
-  const names = roots.map(item => item.name || '目录').join('、')
+  const names = dirs.map(item => item.name || '目录').join('、')
+  if (files.length) return `实际落点：${prefixed}/<${names}>/ 与 ${files.length} 个文件（文件直接放目标目录）`
   return `实际落点：${prefixed}/<${names}>/（各目录连同其内文件一起传）`
 })
 
@@ -867,6 +876,7 @@ function onPickerResolve(payload) {
         name: item.name,
         path: item.path || '/',
         ancestorIds: [...(item.ancestorIds || [])],
+        isFile: Boolean(item.isFile),
       })),
     };
     srcTree.value = null;
@@ -894,7 +904,7 @@ async function scanSource(clearTree = true) {
     scanSummary.value = null
     scanLimitReason.value = ''
   }
-  phaseStatus.value = '正在扫描源目录…'
+  phaseStatus.value = '正在扫描源…'
   let scan = null
   let streamError = ''
   try {
@@ -904,13 +914,14 @@ async function scanSource(clearTree = true) {
         parent_id: item.parentId,
         display_path: item.path || '/',
         ancestor_ids: item.ancestorIds || [],
+        is_file: Boolean(item.isFile),
       })),
       method: curRoute.value.method,
     }, abortCtrl.value?.signal)) {
       if (msg.event === 'progress') {
         const directories = Number(msg.directories || 0)
         const files = Number(msg.files || 0)
-        phaseStatus.value = `正在扫描源目录…已扫描 ${directories} 个目录、${files} 个文件`
+        phaseStatus.value = `正在扫描源…已扫描 ${directories} 个目录、${files} 个文件`
       } else if (msg.event === 'end') {
         scan = msg.result
       } else if (msg.event === 'error') {

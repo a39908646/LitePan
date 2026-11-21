@@ -31,6 +31,8 @@ export interface CrossTransferScanSource {
   parent_id: string;
   display_path: string;
   ancestor_ids?: string[];
+  /** 该 source 是一个文件（不是目录）：落点平铺到目标目录。 */
+  is_file?: boolean;
 }
 
 export interface CrossTransferScanRequest {
@@ -112,6 +114,7 @@ export interface CrossTransferPlainEnqueueSource {
   parent_id: string;
   display_path: string;
   ancestor_ids?: string[];
+  is_file?: boolean;
 }
 
 export interface CrossTransferPlainEnqueueRequest {

@@ -30,6 +30,7 @@ type crossTransferScanSource struct {
 	ParentID    string   `json:"parent_id"`
 	DisplayPath string   `json:"display_path"`
 	AncestorIDs []string `json:"ancestor_ids"`
+	IsFile      bool     `json:"is_file,omitempty"`
 }
 
 func toScanRoots(sources []crossTransferScanSource) []crosstransfer.ScanRoot {
@@ -39,6 +40,7 @@ func toScanRoots(sources []crossTransferScanSource) []crosstransfer.ScanRoot {
 			ParentID:    source.ParentID,
 			DisplayPath: source.DisplayPath,
 			AncestorIDs: source.AncestorIDs,
+			IsFile:      source.IsFile,
 		})
 	}
 	return roots
