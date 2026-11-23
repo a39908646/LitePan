@@ -27,6 +27,10 @@ type stagingFile struct {
 	size     int64
 	modTime  time.Time
 	mu       sync.RWMutex
+	// createdAt 记录本会话建节点的时间，用于判定“一直没入队”的孤儿节点。
+	createdAt time.Time
+	// parentDir 是节点所在的目录，回收失效节点时用它摘掉 dentry。
+	parentDir *cloudDir
 	// parentID/displayPath 记录上传目标目录，rename 跨目录时同步更新，Flush 以最新值为准。
 	parentID    string
 	displayPath string
@@ -45,6 +49,42 @@ var (
 	_ fs.FileReader    = (*localStagingReadHandle)(nil)
 	_ fs.FileReleaser  = (*localStagingReadHandle)(nil)
 )
+
+// stale 判定 staging 节点是否已经不可能变成网盘上的文件：先取上传任务快照，
+// 再交给 stagingNodeStale 做判定（判定本身是与 fuse 无关的纯逻辑，可在任意平台测试）。
+//
+// 排队中、上传中、已成功的任务都算有效：网盘目录列表存在最终一致性，
+// 把“只是还看不见”的节点当成不存在会误删用户刚写入的文件。
+func (f *stagingFile) stale(ctx context.Context) bool {
+	f.mu.RLock()
+	taskID := f.taskID
+	uploads := f.uploads
+	createdAt := f.createdAt
+	f.mu.RUnlock()
+	expired := !createdAt.IsZero() && time.Since(createdAt) > stagingOrphanTTL
+	if taskID == "" || uploads == nil {
+		return stagingNodeStale(false, "", expired)
+	}
+	// 任务记录已经不在了（被删/被清理）：云端不会再有这个文件，超时后回收。
+	task, ok := uploads.Get(ctx, taskID)
+	if !ok {
+		return stagingNodeStale(false, "", expired)
+	}
+	return stagingNodeStale(true, task.Status, expired)
+}
+
+// recycle 删掉本地临时文件。只有确定这个节点永远不会产出云端文件时才调用。
+func (f *stagingFile) recycle() {
+	f.mu.RLock()
+	tempPath := f.tempPath
+	f.mu.RUnlock()
+	if tempPath == "" {
+		return
+	}
+	if err := os.Remove(tempPath); err != nil && !os.IsNotExist(err) && f.b != nil && f.b.deps.Log != nil {
+		f.b.deps.Log.Debug("FUSE staging 临时文件清理失败", "path", tempPath, "err", err)
+	}
+}
 
 func (d *cloudDir) Create(ctx context.Context, name string, flags uint32, _ uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
 	name, errno := normalizeChildName(name)
@@ -68,6 +108,8 @@ func (d *cloudDir) Create(ctx context.Context, name string, flags uint32, _ uint
 		name:        name,
 		tempPath:    tmpPath,
 		modTime:     time.Now(),
+		createdAt:   time.Now(),
+		parentDir:   d,
 		parentID:    d.item.ID,
 		displayPath: d.targetDisplayPath(),
 	}
@@ -304,8 +346,16 @@ func (h *stagingUploadHandle) Release(_ context.Context) syscall.Errno {
 	}
 	h.released = true
 	// 最后一次关闭：此时所有写入都已落地，可以安全地按真实大小建上传任务。
-	if errno := h.queueUpload(); errno != 0 && h.node != nil && h.node.b != nil && h.node.b.deps.Log != nil {
-		h.node.b.deps.Log.Warn("FUSE staging 入队失败", "name", h.fileName, "errno", errno)
+	if errno := h.queueUpload(); errno != 0 {
+		// 建任务失败：这个临时文件永远不会变成云端文件，必须连同节点一起回收。
+		// 只打日志会把节点留在目录里，之后同一个名字的写入/移动会撞上它：
+		// rename 报 EEXIST、copy 打开报 EROFS（看着像“文件已存在”/“只读文件系统”）。
+		if h.node != nil && h.node.b != nil && h.node.b.deps.Log != nil {
+			h.node.b.deps.Log.Warn("FUSE staging 入队失败", "name", h.fileName, "errno", errno)
+		}
+		if h.node != nil && h.node.parentDir != nil {
+			h.node.parentDir.dropStagingNode(h.node)
+		}
 	}
 	if h.file != nil {
 		_ = h.file.Close()

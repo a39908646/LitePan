@@ -26,6 +26,8 @@ type ReadCache interface {
 
 type UploadManager interface {
 	Create(ctx context.Context, p upload.CreateParams) (*upload.Task, error)
+	// Get 取上传任务快照，用来判定 staging 节点背后是否还有一个真有希望成功的任务。
+	Get(ctx context.Context, taskID string) (*upload.Task, bool)
 	// RenameTask 在上传任务尚未开始传输时更新目标文件名与目标目录；返回是否已生效。
 	RenameTask(ctx context.Context, taskID, newName, newTargetPath, newDisplayPath string) (bool, error)
 	// Delete 删除上传任务，并可选删除已上传到网盘的文件。

@@ -66,18 +66,31 @@ func (d *cloudDir) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 		})
 	}
 	// 合并本会话内已创建、但网盘列表尚未可见的 staging 文件，保证刚写入的文件立即可见。
+	// 但已确定失败/取消的 staging 节点不能合并：它们永远不会产出云端文件，
+	// 一旦被列出来，内核就会把它当成真实条目缓存住，之后 rename 报 EEXIST、
+	// copy 写打开报 EROFS（看起来像“文件已存在”/“只读文件系统”）。
+	var staleStaging []*stagingFile
 	for name, ch := range d.Children() {
 		if _, ok := seen[name]; ok {
 			continue
 		}
-		if _, ok := ch.Operations().(*stagingFile); ok {
-			entries = append(entries, fuse.DirEntry{
-				Name: name,
-				Mode: fuse.S_IFREG,
-				Ino:  ch.StableAttr().Ino,
-			})
-			seen[name] = struct{}{}
+		st, ok := ch.Operations().(*stagingFile)
+		if !ok {
+			continue
 		}
+		if st.stale(ctx) {
+			staleStaging = append(staleStaging, st)
+			continue
+		}
+		entries = append(entries, fuse.DirEntry{
+			Name: name,
+			Mode: fuse.S_IFREG,
+			Ino:  ch.StableAttr().Ino,
+		})
+		seen[name] = struct{}{}
+	}
+	for _, st := range staleStaging {
+		d.dropStagingNode(st)
 	}
 	return fs.NewListDirStream(entries), 0
 }
@@ -87,6 +100,11 @@ func (d *cloudDir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) 
 	if ch := d.GetChild(name); ch != nil {
 		switch n := ch.Operations().(type) {
 		case *stagingFile:
+			// 失效的 staging 节点当成不存在：回收后继续走云端查询（大概率 ENOENT）。
+			if n.stale(ctx) {
+				d.dropStagingNode(n)
+				break
+			}
 			var a fuse.AttrOut
 			if errno := n.Getattr(ctx, nil, &a); errno != 0 {
 				return nil, errno
@@ -163,7 +181,11 @@ func (d *cloudDir) Unlink(ctx context.Context, name string) syscall.Errno {
 	}
 	if ch := d.GetChild(name); ch != nil {
 		if st, ok := ch.Operations().(*stagingFile); ok {
-			return d.unlinkStaging(st)
+			errno := d.unlinkStaging(st)
+			// 必须连节点一起摘掉：stagingFile 会在 Readdir 里被合并成真实条目，
+			// 只删临时文件会让这个不存在的文件一直“看得见”，后续 rename/copy 撞上它。
+			d.RmChild(name)
+			return errno
 		}
 	}
 	item, errno := d.lookupChildItem(ctx, name)
@@ -225,8 +247,14 @@ func (d *cloudDir) Rename(ctx context.Context, name string, newParent fs.InodeEm
 		return syscall.EXDEV
 	}
 	// 目标名冲突检查（内存节点优先）。
-	if targetDir.GetChild(newName) != nil {
-		return syscall.EEXIST
+	// 例外：内存里那个同名节点是已经失效的 staging 残留（永远不会有云端文件），
+	// 它不算冲突，否则一次写入失败会让这个名字永久不可用。
+	if ch := targetDir.GetChild(newName); ch != nil {
+		if st, ok := ch.Operations().(*stagingFile); ok && st.stale(ctx) {
+			targetDir.dropStagingNode(st)
+		} else {
+			return syscall.EEXIST
+		}
 	}
 	if _, found, errno := targetDir.lookupChildItemIfExists(ctx, newName); errno != 0 {
 		return errno
@@ -237,6 +265,10 @@ func (d *cloudDir) Rename(ctx context.Context, name string, newParent fs.InodeEm
 	if src := d.GetChild(name); src != nil {
 		switch n := src.Operations().(type) {
 		case *stagingFile:
+			if n.stale(ctx) {
+				d.dropStagingNode(n)
+				return syscall.ENOENT
+			}
 			return d.renameStaging(ctx, n, targetDir, newName)
 		case *cloudDir:
 			if errno := d.renameNode(ctx, name, &n.item, &n.freshAt, targetDir, newName); errno != 0 {
@@ -480,6 +512,33 @@ func (d *cloudDir) healStaleChild(ctx context.Context, name string, freshAt time
 		d.b.deps.Log.Warn("FUSE 清理幽灵节点", "name", name, "parent_id", d.item.ID)
 	}
 	return syscall.ENOENT
+}
+
+// dropStagingNode 回收一个已经失效的 staging 节点：摘掉 dentry、取消/删除它背后的
+// 上传任务、删掉本地临时文件。
+//
+// 不回收的后果不是“多一个不可见的节点”：Readdir 会把 staging 节点合并进目录列表，
+// 于是它看起来就是一个真实文件，内核也会把它缓存成已存在 —— 之后同名 rename 报
+// EEXIST、copy 打开报 EROFS。一次上传失败就能让一个文件名永久不可用。
+func (d *cloudDir) dropStagingNode(st *stagingFile) {
+	if st == nil {
+		return
+	}
+	st.mu.RLock()
+	name := st.name
+	taskID := st.taskID
+	uploads := st.uploads
+	st.mu.RUnlock()
+	d.RmChild(name)
+	if taskID != "" && uploads != nil {
+		if _, err := uploads.Delete(context.Background(), taskID, false); err != nil && d.b.deps.Log != nil {
+			d.b.deps.Log.Debug("FUSE staging 回收时删除上传任务失败", "task_id", taskID, "err", err)
+		}
+	}
+	st.recycle()
+	if d.b.deps.Log != nil {
+		d.b.deps.Log.Debug("FUSE 回收失效 staging 节点", "name", name, "parent_id", d.item.ID)
+	}
 }
 
 // markFresh 给本次会话新建/刚改名的节点打上保护窗口。
